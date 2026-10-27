@@ -26,6 +26,7 @@
         <project.build.outputTimestamp>2024-01-01T00:00:00Z</project.build.outputTimestamp>
         <enforcer-plugin.version>3.5.0</enforcer-plugin.version>
         <surefire.version>3.2.5</surefire.version>
+        <compiler-plugin.version>3.13.0</compiler-plugin.version>
     </properties>
 
     <dependencyManagement>
@@ -55,7 +56,13 @@
                 </plugin>
                 <plugin>
                     <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-shade-plugin</artifactId>
+                    <version>${shade.version}</version>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-compiler-plugin</artifactId>
+                    <version>${compiler-plugin.version}</version>
                     <configuration>
                         <!-- 显式声明注解处理器：不依赖 JDK 版本对 classpath 扫描的默认行为 -->
                         <annotationProcessorPaths>

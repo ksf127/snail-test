@@ -6,6 +6,10 @@ server:
 spring:
   application:
     name: demo01-service
+  inetutils:
+    # 只从真实网卡（WLAN 10.5.x）选注册 IP，避免选到 WSL 虚拟网卡 172.27.80.1
+    preferred-networks:
+      - 10.5.
   config:
     import:
       - optional:nacos:application.yaml?group=DEFAULT_GROUP&refreshEnabled=true
@@ -14,7 +18,7 @@ spring:
     nacos:
       server-addr: ${NACOS_ADDR:127.0.0.1:8848}
       username: ${NACOS_USERNAME:nacos}
-      password: ${NACOS_PASSWORD:nacos}
+      password: ${NACOS_PASSWORD:123456}
       discovery:
         namespace: ${NACOS_NS:}
         group: ${NACOS_GROUP:DEFAULT_GROUP}

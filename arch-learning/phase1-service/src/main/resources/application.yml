@@ -1,0 +1,12 @@
+server:
+  port: 8201
+  servlet:
+    context-path: /phase1
+
+spring:
+  application:
+    name: phase1-service
+
+# 阶段一：多线程 + 设计模式
+# 纯本地独立启动，不接 Nacos，控制器全部挂在 /phase1 下。
+# 虚拟线程实验需要 JDK 21（见本模块 pom 的 java.version）。

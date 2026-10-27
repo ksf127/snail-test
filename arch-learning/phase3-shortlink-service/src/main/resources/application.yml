@@ -1,0 +1,61 @@
+server:
+  port: 8203
+  servlet:
+    context-path: /shortlink
+
+spring:
+  application:
+    name: phase3-shortlink-service
+
+company:
+  lock:
+    provider: memory
+    default-lease-time: 5s
+    watchdog: true
+    key-prefix: "shortlink:lock:"
+  thread-pool:
+    enabled: true
+    await-termination: 10s
+    executors:
+      # 号段异步预取：任务极短且不允许排队太久，队列小 + CALLER_RUNS 兜底
+      shortlink-prefetch:
+        core-pool-size: 1
+        max-pool-size: 2
+        queue-capacity: 8
+        max-queue-capacity: 64
+        keep-alive: 30s
+        rejected-policy: CALLER_RUNS
+
+shortlink:
+  # 拼给调用方的完整短链前缀
+  domain: http://localhost:8203/shortlink
+  segment:
+    # memory：进程内自增，单测零依赖；redis：INCRBY 原子发号，多实例唯一
+    store: memory
+    step: 10000
+    # 剩余号段低于 step * 该比例时异步预取下一段
+    prefetch-threshold: 0.2
+    key: "shortlink:segment"
+  cache:
+    # memory：本地 Map 模拟 L2；redis：走 RedisCacheService
+    remote: memory
+    l1-max-size: 100000
+    l1-ttl: 10m
+    l1-negative-ttl: 30s
+    l2-ttl: 30m
+    l2-negative-ttl: 2m
+    # TTL 抖动比例，避免同一批 key 同时过期造成雪崩
+    ttl-jitter: 0.1
+    # 单飞回源的锁等待/租期；拿不到锁直接降级查库，绝不把请求挂死
+    lock-wait: 2s
+    lock-lease: 5s
+  bloom:
+    type: memory
+    expected-insertions: 1000000
+    false-positive-rate: 0.0001
+    key: "shortlink:bloom"
+    warm-up: true
+  click:
+    store: memory
+    hash-key: "shortlink:clicks"
+    flush-interval-millis: 1000

@@ -13,7 +13,7 @@
     <!--
       根 POM 只做聚合：不写 dependencyManagement、不写 pluginManagement。
       版本策略在 company-bom，构建约束在 company-parent。
-      新增服务只能加在 company-services/ 下。
+      业务微服务加在 company-services/ 下；三阶段学习实验加在 arch-learning/ 下。
     -->
     <modules>
         <module>company-bom</module>
@@ -22,5 +22,6 @@
         <module>company-starters</module>
         <module>company-api</module>
         <module>company-services</module>
+        <module>arch-learning</module>
     </modules>
 </project>

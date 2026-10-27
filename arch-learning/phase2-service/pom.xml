@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.company</groupId>
+        <artifactId>arch-learning</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>phase2-service</artifactId>
+    <name>phase2-service</name>
+    <description>阶段二：多级缓存 + 缓存一致性/幂等/限流/超卖场景 + 分布式锁（memory/redis/redisson）</description>
+
+    <dependencies>
+        <!-- 缓存出口：memory 与 redis 两种 L2 由 arch-lab.cache.remote 切换 -->
+        <dependency>
+            <groupId>com.company</groupId>
+            <artifactId>company-redis-starter</artifactId>
+        </dependency>
+        <!-- 分布式锁：provider 三选一（memory / redis / redisson） -->
+        <dependency>
+            <groupId>com.company</groupId>
+            <artifactId>company-lock-starter</artifactId>
+        </dependency>
+        <!-- 版本由 spring-boot-dependencies 管理 -->
+        <dependency>
+            <groupId>com.github.ben-manes.caffeine</groupId>
+            <artifactId>caffeine</artifactId>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>

@@ -20,5 +20,7 @@
         <module>company-mybatis-starter</module>
         <module>company-mq-starter</module>
         <module>company-job-starter</module>
+        <module>company-threadpool-starter</module>
+        <module>company-lock-starter</module>
     </modules>
 </project>

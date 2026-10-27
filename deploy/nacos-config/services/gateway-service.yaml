@@ -5,6 +5,9 @@
 #   user-service   /internal/users/**   -> /api/user/**、/api/users/**
 #   order-service  /orders/**           -> /api/order/**、/api/orders/**
 #   demoXX         context-path=/demo-XX -> /api/demo-XX/**
+#   arch-lab       context-path=/arch-lab -> /api/arch-lab/**
+#   shortlink      context-path=/shortlink -> /api/shortlink/**
+#   mall           context-path=/mall     -> /api/mall/**
 # Nacos: dataId=gateway-service.yaml, group=DEFAULT_GROUP
 server:
   port: 8080

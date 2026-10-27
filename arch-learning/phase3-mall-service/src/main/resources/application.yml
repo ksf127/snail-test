@@ -1,0 +1,40 @@
+server:
+  port: 8204
+  servlet:
+    context-path: /mall
+
+spring:
+  application:
+    name: phase3-mall-service
+
+company:
+  lock:
+    # memory：进程内实现，单测零依赖；redis / redisson 走真实中间件
+    provider: memory
+    default-lease-time: 10s
+    watchdog: true
+    key-prefix: "mall:lock:"
+  mall:
+    order:
+      # 下单请求号与订单状态迁移的等锁/租期：支付是长事务，租期要留足
+      lock-wait: 3s
+      lock-lease: 10s
+      pay-timeout: 30m
+    outbox:
+      enabled: true
+      # memory：进程内 Broker；rabbit：真实 RabbitMQ（需先配好 spring.rabbitmq）
+      transport: memory
+      exchange: mall.order.events
+      batch-size: 50
+      max-attempts: 8
+      base-backoff: 1s
+      max-backoff: 1m
+      interval-millis: 500
+      confirm-timeout: 3s
+    notify:
+      enabled: true
+      # 最大努力通知：只尽力 6 次，之后进死信，由商户主动查询对齐
+      max-attempts: 6
+      base-backoff: 1s
+      max-backoff: 30s
+      interval-millis: 1000

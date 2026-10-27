@@ -1,0 +1,24 @@
+server:
+  port: 8202
+  servlet:
+    context-path: /phase2
+
+spring:
+  application:
+    name: phase2-service
+
+company:
+  lock:
+    # memory：单进程内可重入锁，单测/演示零依赖
+    # redis：自研 SET NX PX + Lua 校验 + 看门狗（需要 Redis 可用）
+    # redisson：第三方实现对照
+    provider: memory
+    default-lease-time: 30s
+    watchdog: true
+    key-prefix: "phase2:lock:"
+
+arch-lab:
+  cache:
+    # memory：用本地 Map 模拟 L2，开箱即用
+    # redis：改用 StringRedisTemplate，需要本地 Redis 可用
+    remote: memory

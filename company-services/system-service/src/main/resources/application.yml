@@ -12,7 +12,7 @@ spring:
     nacos:
       server-addr: ${NACOS_ADDR:127.0.0.1:8848}
       username: ${NACOS_USERNAME:nacos}
-      password: ${NACOS_PASSWORD:nacos}
+      password: ${NACOS_PASSWORD:123456}
       discovery:
         namespace: ${NACOS_NS:}
         group: ${NACOS_GROUP:DEFAULT_GROUP}

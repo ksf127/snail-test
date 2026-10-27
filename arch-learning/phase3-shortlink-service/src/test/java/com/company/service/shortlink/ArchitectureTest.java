@@ -1,0 +1,36 @@
+package com.company.service.shortlink;
+
+import com.tngtech.archunit.core.importer.ImportOption;
+import com.tngtech.archunit.junit.AnalyzeClasses;
+import com.tngtech.archunit.junit.ArchTest;
+import com.tngtech.archunit.lang.ArchRule;
+
+import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses;
+
+/**
+ * 架构守卫：违规即构建失败，不依赖 Code Review 的记忆力。
+ */
+@AnalyzeClasses(packages = "com.company.service.shortlink", importOptions = ImportOption.DoNotIncludeTests.class)
+public class ArchitectureTest {
+
+    @ArchTest
+    static final ArchRule web_must_not_touch_infra = noClasses()
+            .that().resideInAPackage("..shortlink.web..")
+            .should().dependOnClassesThat().resideInAnyPackage("..shortlink.infra..")
+            .because("Web 层只能调用 Service：缓存/存储/号段实现属于 infra，不允许上浮到接口层");
+
+    @ArchTest
+    static final ArchRule service_must_not_touch_starter_internals = noClasses()
+            .that().resideInAPackage("..shortlink.service..")
+            .should().dependOnClassesThat().resideInAnyPackage(
+                    "org.springframework.data.redis..",
+                    "com.baomidou.mybatisplus..",
+                    "redis.clients..")
+            .because("中间件客户端只能由 company-*-starter 封装，业务层不得直接依赖");
+
+    @ArchTest
+    static final ArchRule no_feign_client_outside_contract = noClasses()
+            .that().resideInAPackage("com.company.service.shortlink..")
+            .should().beAnnotatedWith("org.springframework.cloud.openfeign.FeignClient")
+            .because("Feign 契约只能定义在 company-api 中");
+}

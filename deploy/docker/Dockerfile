@@ -1,6 +1,7 @@
 # 多阶段构建：构建产物在 CI 产出，这里只负责组装运行镜像
 # docker build -f deploy/docker/Dockerfile --build-arg JAR_FILE=company-services/order-service/target/order-service-1.0.0-SNAPSHOT.jar -t order-service:1.0.0 .
-FROM eclipse-temurin:17-jre-alpine
+# 运行基线 21：phase1-service 以 --release 21 编译（虚拟线程），其余模块 17 的字节码在 21 上兼容
+FROM eclipse-temurin:21-jre-alpine
 
 RUN addgroup -S app && adduser -S app -G app
 

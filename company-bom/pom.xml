@@ -24,6 +24,9 @@
         <archunit.version>1.3.0</archunit.version>
         <jjwt.version>0.12.5</jjwt.version>
         <lombok.version>1.18.30</lombok.version>
+        <jmh.version>1.37</jmh.version>
+        <shade.version>3.5.2</shade.version>
+        <redisson.version>3.27.2</redisson.version>
     </properties>
 
     <dependencyManagement>
@@ -63,11 +66,31 @@
                 <scope>test</scope>
             </dependency>
 
+            <!-- JMH：只给 arch-learning-benchmark 用，避免业务模块误引基准测试框架 -->
+            <dependency>
+                <groupId>org.openjdk.jmh</groupId>
+                <artifactId>jmh-core</artifactId>
+                <version>${jmh.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.openjdk.jmh</groupId>
+                <artifactId>jmh-generator-annprocess</artifactId>
+                <version>${jmh.version}</version>
+                <scope>provided</scope>
+            </dependency>
+
             <!--
               Flyway 由上面导入的 spring-boot-dependencies 统一管理版本，
               这里不再重复声明（dependencyManagement 自身不允许省略 version）。
               业务侧与 Starter 引 flyway-core / flyway-mysql 时同样不写 version。
             -->
+
+            <!-- Redisson：只在 company-lock-starter 里以 optional 方式引入，业务模块不直接依赖 -->
+            <dependency>
+                <groupId>org.redisson</groupId>
+                <artifactId>redisson</artifactId>
+                <version>${redisson.version}</version>
+            </dependency>
 
             <!-- JWT：auth-service 签发与校验令牌，版本只在这里维护 -->
             <dependency>
@@ -117,6 +140,16 @@
             <dependency>
                 <groupId>com.company</groupId>
                 <artifactId>company-job-starter</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.company</groupId>
+                <artifactId>company-threadpool-starter</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.company</groupId>
+                <artifactId>company-lock-starter</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>

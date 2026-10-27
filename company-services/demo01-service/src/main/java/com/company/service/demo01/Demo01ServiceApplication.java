@@ -10,6 +10,8 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
 public class Demo01ServiceApplication {
 
     public static void main(String[] args) {
+
         SpringApplication.run(Demo01ServiceApplication.class, args);
+        System.out.println("测试启动，微服务Demo01ServiceApplication启动成功了！！！！！");
     }
 }
