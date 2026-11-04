@@ -135,8 +135,10 @@ public class StockLab {
             throw new IllegalArgumentException("instances 必须在 [1, 8] 之间");
         }
 
-        log.info("【库存超卖实验】开始，mode={}（{}），初始库存={}，买家数={}，实例数={}",
-                mode, mode.label(), initialStock, buyers, instances);
+        log.info("【库存超卖实验】测什么：{} 件库存被 {} 个买家并发各买 1 件，看会不会卖出超过库存；"
+                        + "谁和谁对照：A组 NONE / B组 LOCAL_LOCK（受控竞态）vs C组 OPTIMISTIC / D组 ROW_LOCK / "
+                        + "E组 REDIS_LOCK（真实并发）；本次跑 {}（{}），实例数={}",
+                initialStock, buyers, mode, mode.label(), instances);
         Inventory inventory = new Inventory(initialStock, instances);
         long start = System.nanoTime();
 
@@ -164,12 +166,35 @@ public class StockLab {
                 inventory.conflicts.get(),
                 remaining >= 0 && remaining + sold == initialStock,
                 TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start));
-        log.info("【库存超卖实验】结束，mode={}，已售={}，剩余={}，超卖={}，乐观锁冲突={}，" +
-                        "恒等式成立={}，耗时={}ms",
-                mode, result.sold(), result.remaining(), result.oversold(), result.conflicts(),
-                result.consistent(), result.elapsedMillis());
-        if (!result.consistent() || result.oversold() > 0) {
-            log.warn("【库存超卖实验】{} 模式出现超卖/丢更新：库存+已售 != 初始库存", mode);
+        log.info("【库存超卖实验】{}（{}）｜结果：已售 {}，剩余 {}，超卖 {}，乐观锁冲突 {}，恒等式成立 {}，耗时 {}ms",
+                mode, result.label(), result.sold(), result.remaining(), result.oversold(),
+                result.conflicts(), result.consistent(), result.elapsedMillis());
+        if (result.consistent() && result.oversold() == 0) {
+            switch (mode) {
+                case NONE -> log.warn("【库存超卖实验】判读：A组本轮恒等式居然成立，通常是只有 1 个买家或竞态没重叠，"
+                        + "把 buyers 调到 10 以上重跑才能看到丢更新");
+                case LOCAL_LOCK -> log.warn("【库存超卖实验】判读：B组本轮恒等式成立，说明实例数只有 1（只有一把锁）；"
+                        + "instances≥2 时才会看到跨实例丢更新 —— 单机锁在集群里等于没锁");
+                case OPTIMISTIC -> log.info("【库存超卖实验】判读：C组恒等式成立，CAS 冲突 {} 次后重试成功；"
+                        + "冲突不高时比锁更轻，冲突高时要限制重试次数并降级",
+                        result.conflicts());
+                case ROW_LOCK -> log.info("【库存超卖实验】判读：D组恒等式成立 —— 行锁把「判断 + 扣减」关进同一事务，"
+                        + "并发高时买家会排队，用吞吐换正确性");
+                case REDIS_LOCK -> log.info("【库存超卖实验】判读：E组恒等式成立 —— 跨进程互斥生效；"
+                        + "代价是每次扣减两次 Redis 往返，锁超时时间要覆盖业务耗时");
+            }
+        } else {
+            switch (mode) {
+                case NONE -> log.warn("【库存超卖实验】判读：A组超卖 {} 件 —— 读和写之间没有互斥，"
+                                + "多个买家基于同一快照写回，后写覆盖先写",
+                        result.oversold());
+                case LOCAL_LOCK -> log.warn("【库存超卖实验】判读：B组超卖 {} 件 —— {} 个实例各锁各的，"
+                                + "同时读到库存 1 都判断「还有」，单机锁在集群里等于没锁",
+                        result.oversold(), instances);
+                default -> log.warn("【库存超卖实验】判读：{} 组（{}）出现超卖 {} 件，"
+                                + "说明互斥/重试没有覆盖完整临界区，不可用于生产",
+                        mode, result.label(), result.oversold());
+            }
         }
         return result;
     }

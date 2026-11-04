@@ -127,14 +127,20 @@ public class DistributedTxLab {
             throw new IllegalArgumentException("failAt 必须在 [-1, " + (BRANCHES - 1) + "] 之间");
         }
         // 先打入口日志：failAt 是复现失败场景的唯一开关，出了问题先看这一行
-        log.info("【分布式事务实验】开始: mechanism={}, failAt={}", mechanism, failAt);
+        log.info("【分布式事务实验】测什么：一笔「建订单 → 扣库存 → 扣余额」在 failAt={} 时的提交/回滚路径；"
+                        + "本次 mechanism={}（{}）", failAt, mechanism.label(), mechanism.isolation());
         Result result = switch (mechanism) {
             case AT -> runAt(failAt);
             case TCC -> runTcc(failAt);
             case SAGA -> runSaga(failAt);
         };
-        log.info("【分布式事务实验】结束: mechanism={}, completed={}, consistent={}, failure={}",
-                result.mechanism(), result.completed(), result.consistent(), result.failure());
+        log.info("【分布式事务实验】结束: mechanism={}, completed={}, consistent={}, failure={}；判读：{}",
+                result.mechanism(), result.completed(), result.consistent(), result.failure(),
+                result.consistent()
+                        ? (result.completed()
+                                ? "全部成功且终态一致：库存与余额已扣减、订单存在、无冻结残留"
+                                : "失败已完整回滚：库存与余额回到初始值、订单不存在、无冻结残留")
+                        : "终态不一致：存在未回滚的分支或冻结残留，说明补偿没有覆盖全部已执行分支");
         return result;
     }
 
@@ -146,6 +152,10 @@ public class DistributedTxLab {
      */
     public List<Result> compare(int failAt) {
         List<Result> results = new ArrayList<>(BRANCHES);
+        log.info("【分布式事务实验】测什么：同一笔 failAt={} 的业务在 AT / TCC / Saga 三种机制下的终态与回滚代价",
+                failAt);
+        log.info("【分布式事务实验】谁和谁对照：A组 AT（undo log 回滚）、B组 TCC（Cancel 释放冻结）、"
+                + "C组 Saga（反向补偿）；三组跑同一 failAt={}", failAt);
         for (Mechanism mechanism : Mechanism.values()) {
             results.add(run(mechanism, failAt));
         }
@@ -158,6 +168,18 @@ public class DistributedTxLab {
                                 + ", balance=" + r.balanceAvailable()
                                 + ", order=" + r.orderPresent() + "]")
                         .toList());
+        boolean allConsistent = results.stream().allMatch(Result::consistent);
+        // 顺序与 Mechanism.values() 一致：0=AT，1=TCC，2=Saga，这里直接按下标取回滚代价
+        Result at = results.get(0);
+        Result tcc = results.get(1);
+        Result saga = results.get(2);
+        log.info("【分布式事务实验】判读：{}；回滚代价 AT=undoLog 回放 {} 条/锁冲突 {} 次，"
+                        + "TCC=Cancel {} 次/锁冲突 {} 次，Saga=补偿 {} 次（含重试 {} 次）；"
+                        + "三者都靠补偿换一致性，差别在中间态是否可见与回滚成本",
+                allConsistent ? "三种机制终态均与业务预期一致" : "存在终态不一致的机制，见上方各自结果",
+                at.undoLogsApplied(), at.lockConflicts(),
+                tcc.compensations(), tcc.lockConflicts(),
+                saga.compensations(), saga.compensationRetries());
         return List.copyOf(results);
     }
 

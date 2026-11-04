@@ -114,8 +114,11 @@ public class ConsistencyLab {
             throw new IllegalArgumentException("rounds 必须在 [1, 1000] 之间");
         }
 
-        log.info("【缓存一致性实验】开始，strategy={}（{}），rounds={}",
+        log.info("【缓存一致性实验】测什么：同一条「读缓存→回源→回填」读路径配上不同写路径，"
+                        + "看哪一组会在缓存里留下长期脏数据；谁和谁对照：A组 先更库后删缓存 / B组 先删缓存后更库 / "
+                        + "C组 延迟双删 / D组 读写共用 key 锁；本次跑 {}（{}），rounds={}",
                 strategy, strategy.label(), rounds);
+        log.info("【缓存一致性实验】本次策略（{}）的机制：{}", strategy.label(), consistencyMechanism(strategy));
         int dirtyRounds = 0;
         int staleFills = 0;
         Round last = null;
@@ -140,14 +143,35 @@ public class ConsistencyLab {
                 last.observed(),
                 last.db,
                 List.copyOf(last.steps));
-        log.info("【缓存一致性实验】结束，strategy={}，脏轮数={}/{}，脏回填轮数={}，" +
-                        "最终缓存值={}，数据库值={}",
-                strategy, dirtyRounds, rounds, staleFills, result.finalValue(), result.dbValue());
+        log.info("【缓存一致性实验】{}｜结果：{} 轮里脏轮数 {}/{}，脏回填轮数 {}/{}，最终缓存值={}，数据库值={}",
+                strategy.label(), rounds, dirtyRounds, rounds, staleFills, rounds,
+                result.finalValue(), result.dbValue());
         if (result.dirty()) {
-            log.warn("【缓存一致性实验】策略 {} 会在最后留下缓存脏数据，详见 timeline",
-                    strategy);
+            log.warn("【缓存一致性实验】判读：{} 组 {} 轮里有 {} 轮留下脏数据（缓存={}，数据库={}），"
+                            + "说明这条写路径存在无法自愈的竞态窗口；用户会一直读到旧值，刷新多少次都没用",
+                    strategy.label(), rounds, dirtyRounds, result.finalValue(), result.dbValue());
+        } else {
+            log.info("【缓存一致性实验】判读：{} 组 {} 轮结束后缓存与数据库一致，"
+                            + "说明删除动作或 key 锁覆盖了回填窗口",
+                    strategy.label(), rounds);
         }
         return result;
+    }
+
+    /**
+     * 给日志用的机制说明：四种策略的差别只在「删除缓存」相对「更库」和「回填」的位置。
+     */
+    private static String consistencyMechanism(Strategy strategy) {
+        return switch (strategy) {
+            case UPDATE_DB_THEN_DELETE_CACHE ->
+                    "回填发生在删缓存之后，旧值被重新写回，而且此后再也没人删它";
+            case DELETE_CACHE_THEN_UPDATE_DB ->
+                    "回填发生在删缓存之后、更库之前，删掉的缓存又被旧值填了回来";
+            case DELAYED_DOUBLE_DELETE ->
+                    "第二次删除把「删缓存与更库之间」回填的旧值再清一次，缩小但不是消除窗口";
+            case LOCK_PROTECTED ->
+                    "读写共用 key 锁，回填与「更库+删缓存」互斥，不存在交错窗口";
+        };
     }
 
     /**

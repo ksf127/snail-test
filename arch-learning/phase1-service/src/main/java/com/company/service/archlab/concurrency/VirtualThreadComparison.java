@@ -75,8 +75,10 @@ public class VirtualThreadComparison {
      * @throws IllegalStateException    任务在 120s 内没跑完，或主线程被中断
      */
     public Comparison compare(int tasks, long ioMillis, int platformPoolSize) {
-        log.info("【线程模型对比】开始，任务数={}，单任务阻塞={}ms，平台线程池={}",
-                tasks, ioMillis, platformPoolSize);
+        log.info("【线程模型对比】测什么：同一批阻塞型任务在两种调度模型下的墙钟耗时；"
+                        + "谁和谁对照：A组 平台线程池(容量{}，超出部分只能排队) vs B组 虚拟线程(每任务一个线程)；"
+                        + "参数：任务数={}，单任务阻塞={}ms",
+                platformPoolSize, tasks, ioMillis);
         // 先跑平台线程，再跑虚拟线程：顺序执行避免两组抢同一批 CPU 核，数字才可比
         Result platform = runPlatform(tasks, ioMillis, platformPoolSize);
         Result virtual = runVirtual(tasks, ioMillis);
@@ -85,9 +87,13 @@ public class VirtualThreadComparison {
                 ? 0
                 : (double) platform.elapsedMillis() / virtual.elapsedMillis();
         double rounded = round(speedup);
-        log.info("【线程模型对比】结束，平台组={}ms（{} 线程），虚拟线程组={}ms（{} 线程），加速比={}x",
-                platform.elapsedMillis(), platform.threads(),
-                virtual.elapsedMillis(), virtual.threads(), rounded);
+        // 判读：只报两组数字，读者还得自己心算理论值，所以把"理论上限"和结论直接写出来
+        long theoreticalPlatform = ((long) Math.ceil((double) tasks / platformPoolSize)) * ioMillis;
+        log.info("【线程模型对比】判读：平台组 {}ms（理论下限约 {}ms，受并发度 {} 限制），"
+                        + "虚拟线程组 {}ms（接近单次阻塞 {}ms），加速比 {}x → {}",
+                platform.elapsedMillis(), theoreticalPlatform, Math.min(tasks, platformPoolSize),
+                virtual.elapsedMillis(), ioMillis, rounded,
+                rounded >= 2.0 ? "阻塞型负载下虚拟线程优势明显" : "差距不大，说明负载不够阻塞或核数已成瓶颈");
         return new Comparison(platform, virtual, rounded);
     }
 

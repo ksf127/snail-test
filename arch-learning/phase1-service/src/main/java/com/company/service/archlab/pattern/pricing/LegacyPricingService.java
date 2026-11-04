@@ -52,19 +52,36 @@ public class LegacyPricingService {
         }
         // 这就是"要改的文件"：任何新优惠都插在这里，所有人改同一行，冲突和回归成本都集中在这一处
         if ("NORMAL".equalsIgnoreCase(code)) {
-            return subtotal.setScale(2, RoundingMode.HALF_UP);
+            return logAndReturn(code, subtotal, subtotal.setScale(2, RoundingMode.HALF_UP));
         } else if ("VIP".equalsIgnoreCase(code)) {
-            return subtotal.multiply(new BigDecimal("0.95")).setScale(2, RoundingMode.HALF_UP);
+            return logAndReturn(code, subtotal,
+                    subtotal.multiply(new BigDecimal("0.95")).setScale(2, RoundingMode.HALF_UP));
         } else if ("PROMOTION".equalsIgnoreCase(code)) {
             // 折扣率是魔法值，和 VipPricingStrategy 里的常量重复定义：
             // 一旦运营改折扣，两边都得改，漏一个就是资损
             if (subtotal.compareTo(new BigDecimal("300")) >= 0) {
-                return subtotal.subtract(new BigDecimal("50")).max(BigDecimal.ZERO).setScale(2, RoundingMode.HALF_UP);
+                return logAndReturn(code, subtotal,
+                        subtotal.subtract(new BigDecimal("50")).max(BigDecimal.ZERO)
+                                .setScale(2, RoundingMode.HALF_UP));
             }
-            return subtotal.setScale(2, RoundingMode.HALF_UP);
+            return logAndReturn(code, subtotal, subtotal.setScale(2, RoundingMode.HALF_UP));
         }
         // 每个分支都自己 throw，看起来没漏，但新增分支时最容易忘的就是这里
         log.warn("【Legacy 计价】未知策略 code={}，请求被判为非法", code);
         throw new BizException(ErrorCode.PARAM_INVALID, "未知计价策略: " + code);
+    }
+
+    /**
+     * 统一出口日志：每个分支都要打，否则 A/B 对照时 Legacy 侧只有异常日志、
+     * 没有正常金额，两边日志不对称，出了问题无法确认"到底哪边算错了"。
+     *
+     * @param code     命中的策略标识
+     * @param subtotal 优惠前小计
+     * @param payable  本分支算出的应付金额
+     * @return 原样返回 payable，便于在 return 语句里内联调用
+     */
+    private BigDecimal logAndReturn(String code, BigDecimal subtotal, BigDecimal payable) {
+        log.info("【Legacy 计价】策略={}，小计={}，应付={}", code.toUpperCase(), subtotal, payable);
+        return payable;
     }
 }

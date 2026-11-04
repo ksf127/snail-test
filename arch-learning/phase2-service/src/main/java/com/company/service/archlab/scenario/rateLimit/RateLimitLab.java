@@ -110,7 +110,9 @@ public class RateLimitLab {
             }
         }
 
-        log.info("【限流实验】开始，mode={}（{}），limit={}，windowMillis={}，请求数={}",
+        log.info("【限流实验】测什么：用同一串「窗口边界两侧各来一批」的请求，看不同算法实际放行多少；"
+                        + "谁和谁对照：A组 FIXED_WINDOW / B组 SLIDING_WINDOW / C组 TOKEN_BUCKET；"
+                        + "本次跑 {}（{}），limit={}，windowMillis={}，请求数={}",
                 mode, mode.label(), limit, windowMillis, times.size());
         List<Long> allowed = switch (mode) {
             case FIXED_WINDOW -> fixedWindow(times, limit, windowMillis);
@@ -126,8 +128,22 @@ public class RateLimitLab {
                 allowed.size(),
                 times.size() - allowed.size(),
                 allowed);
-        log.info("【限流实验】结束，mode={}，放行={}，拒绝={}。{}",
-                mode, result.allowed(), result.rejected(), rateLimitConclusion(mode));
+        log.info("【限流实验】{}｜结果：请求 {}，放行 {}，拒绝 {}，放行时刻={}",
+                mode, times.size(), result.allowed(), result.rejected(), result.allowedTimes());
+        if (mode == Mode.FIXED_WINDOW) {
+            log.info("【限流实验】判读：A组放行 {} 个（limit={}），可能接近 2 倍阈值 —— 计数在窗口切换时清零，"
+                            + "边界两侧的请求分属两个窗口、各自都没超限，但真实一个窗口内放进了两倍流量，"
+                            + "这就是固定窗口的边界漏洞",
+                    result.allowed(), limit);
+        } else if (mode == Mode.SLIDING_WINDOW) {
+            log.info("【限流实验】判读：B组只放行 {} 个（≈limit={}）—— 每个请求都回看最近一个窗口的已放行记录，"
+                            + "边界前的请求仍被计入，所以不会被窗口边界放大",
+                    result.allowed(), limit);
+        } else {
+            log.info("【限流实验】判读：C组放行 {} 个（阈值 limit={}）—— 令牌桶允许桶容量内的突发，"
+                            + "但不会被窗口边界放大，长期速率由补充速度决定",
+                    result.allowed(), limit);
+        }
         return result;
     }
 
@@ -213,13 +229,5 @@ public class RateLimitLab {
             times.add(after);
         }
         return times;
-    }
-
-    private static String rateLimitConclusion(Mode mode) {
-        return switch (mode) {
-            case FIXED_WINDOW -> "固定窗口在边界两侧各放 limit 个，真实窗口内可能翻倍";
-            case SLIDING_WINDOW -> "滑动窗口把边界前的请求也算进来，边界处不会翻倍";
-            case TOKEN_BUCKET -> "令牌桶允许桶容量内的突发，长期速率由补充速度决定";
-        };
     }
 }

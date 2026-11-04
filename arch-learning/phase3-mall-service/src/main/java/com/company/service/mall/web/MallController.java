@@ -91,10 +91,13 @@ public class MallController {
      */
     @PostMapping("/products")
     public ApiResult<ProductView> createProduct(@Valid @RequestBody CreateProductRequest request) {
-        log.info("【接口】创建商品: name={}, priceCents={}, stock={}",
+        log.info("【商品】建档入参: name={}, priceCents={}, stock={}；本接口不幂等，重复提交会建出多件商品",
                 request.name(), request.priceCents(), request.stock());
         Product product = productService.create(request.name(), request.priceCents(), request.stock());
-        return ApiResult.ok(ProductView.from(product, productService.stockOf(product.productId())));
+        ProductService.StockSnapshot stock = productService.stockOf(product.productId());
+        log.info("【商品】建档结果: productId={}, priceCents={}, 可用库存={}",
+                product.productId(), product.priceCents(), stock.available());
+        return ApiResult.ok(ProductView.from(product, stock));
     }
 
     /**
@@ -102,10 +105,11 @@ public class MallController {
      */
     @GetMapping("/products")
     public ApiResult<List<ProductView>> products() {
-        log.info("【接口】查询商品列表");
-        return ApiResult.ok(productService.list().stream()
+        List<ProductView> views = productService.list().stream()
                 .map(product -> ProductView.from(product, productService.stockOf(product.productId())))
-                .toList());
+                .toList();
+        log.info("【商品】列表结果: count={}（只读，无副作用）", views.size());
+        return ApiResult.ok(views);
     }
 
     /**
@@ -115,9 +119,11 @@ public class MallController {
      */
     @GetMapping("/products/{productId}")
     public ApiResult<ProductView> product(@PathVariable("productId") long productId) {
-        log.info("【接口】查询商品: productId={}", productId);
         Product product = productService.get(productId);
-        return ApiResult.ok(ProductView.from(product, productService.stockOf(productId)));
+        ProductService.StockSnapshot stock = productService.stockOf(productId);
+        log.info("【商品】详情结果: productId={}, priceCents={}, 可用库存={}",
+                productId, product.priceCents(), stock.available());
+        return ApiResult.ok(ProductView.from(product, stock));
     }
 
     /**
@@ -129,13 +135,32 @@ public class MallController {
      */
     @PostMapping("/orders")
     public ApiResult<OrderView> placeOrder(@Valid @RequestBody PlaceOrderRequest request) {
-        log.info("【接口】下单请求: requestId={}, userId={}, lines={}",
+        log.info("【下单】接口入参: requestId={}（幂等键）, userId={}, lines={}；分支由服务层判定:"
+                        + "幂等命中 → 直接返回历史单；库存不足/预占异常 → 先回滚再抛；锁冲突 → 未进入主流程",
                 request.requestId(), request.userId(), request.lines());
         List<OrderService.LineRequest> lines = request.lines().stream()
                 .map(line -> new OrderService.LineRequest(line.productId(), line.quantity()))
                 .toList();
-        Order order = orderService.place(request.requestId(), request.userId(), lines);
-        log.info("【接口】下单返回: requestId={}, orderNo={}", request.requestId(), order.orderNo());
+        // 记下请求进入时刻：新建订单的 createdAt 一定晚于它，更早则说明命中了 requestId 幂等键
+        Instant requestedAt = Instant.now();
+        Order order;
+        try {
+            order = orderService.place(request.requestId(), request.userId(), lines);
+        } catch (RuntimeException e) {
+            // 异常类型与消息原样抛出，这里只补接口视角的日志：失败原因写在 message 里（库存不足/商品不存在/锁定冲突）
+            log.warn("【下单】接口失败: requestId={}, 原因={}；判读: 库存不足/预占异常会先由服务层 Cancel 回滚已完成行，"
+                            + "商品不存在或锁冲突则未产生库存变更",
+                    request.requestId(), e.getMessage());
+            throw e;
+        }
+        boolean reused = order.createdAt().isBefore(requestedAt);
+        String branch = reused
+                ? (order.status() == Order.Status.CANCELLED
+                        ? "幂等命中一张已取消的历史单（首次下单失败留下的单），本次未再预占库存"
+                        : "幂等命中已有订单，本次未再预占库存、未重复写事件")
+                : "新建订单，库存已预占，order.created 已写入 outbox";
+        log.info("【下单】接口结果: requestId={}, orderNo={}, status={}, amount={}分, 幂等命中={}, 判读={}",
+                request.requestId(), order.orderNo(), order.status(), order.amountCents(), reused, branch);
         return ApiResult.ok(view(order));
     }
 
@@ -148,8 +173,13 @@ public class MallController {
      */
     @GetMapping("/orders/{orderNo}")
     public ApiResult<OrderView> order(@PathVariable("orderNo") String orderNo) {
-        log.info("【接口】查询订单: orderNo={}", orderNo);
-        return ApiResult.ok(view(orderService.get(orderNo)));
+        Order order = orderService.get(orderNo);
+        OrderView orderView = view(order);
+        log.info("【订单】查询结果: orderNo={}, 写端状态={}, 投影状态={}, 支付流水={}；"
+                        + "写端已终态而投影仍为旧值，说明 outbox 未投递完或消费端未跟上",
+                orderNo, order.status(), orderView.projectedStatus(),
+                orderView.payment() == null ? "无" : orderView.payment().paymentNo());
+        return ApiResult.ok(orderView);
     }
 
     /**
@@ -161,9 +191,12 @@ public class MallController {
      */
     @PostMapping("/orders/{orderNo}/pay")
     public ApiResult<PaymentView> pay(@PathVariable("orderNo") String orderNo) {
-        log.info("【接口】支付请求: orderNo={}", orderNo);
+        log.info("【支付】接口入参: orderNo={}；分支由订单状态判定: CREATED → Confirm + 落流水 + 置 PAID；"
+                + "已 PAID → 只幂等补齐 Confirm/通知/事件，不重复扣库存；其他状态 → 拒绝", orderNo);
         Payment payment = orderService.pay(orderNo);
-        log.info("【接口】支付返回: orderNo={}, paymentNo={}", orderNo, payment.paymentNo());
+        log.info("【支付】接口结果: orderNo={}, paymentNo={}, amount={}分, 订单终态=PAID；"
+                        + "本次各步是否重复执行见【TCC-Confirm】与【支付】阶段日志",
+                orderNo, payment.paymentNo(), payment.amountCents());
         return ApiResult.ok(PaymentView.from(payment));
     }
 
@@ -178,8 +211,12 @@ public class MallController {
     @PostMapping("/orders/{orderNo}/cancel")
     public ApiResult<OrderView> cancel(@PathVariable("orderNo") String orderNo,
                                        @RequestParam(name = "reason", required = false) String reason) {
-        log.info("【接口】取消订单: orderNo={}, reason={}", orderNo, reason);
-        return ApiResult.ok(view(orderService.cancel(orderNo, reason)));
+        log.info("【取消】接口入参: orderNo={}, reason={}；分支由订单状态判定: 已 CANCELLED 幂等返回，"
+                + "CREATED 才归还库存并写 order.cancelled，其他状态直接拒绝", orderNo, reason);
+        Order cancelled = orderService.cancel(orderNo, reason);
+        log.info("【取消】接口结果: orderNo={}, status={}, closeReason={}；库存是否真正归还由【TCC-Cancel】分支日志决定",
+                orderNo, cancelled.status(), cancelled.closeReason());
+        return ApiResult.ok(view(cancelled));
     }
 
     /**
@@ -191,8 +228,10 @@ public class MallController {
      */
     @PostMapping("/ops/orders/close-expired")
     public ApiResult<Integer> closeExpired() {
-        log.info("【接口】手动触发超时关单");
-        return ApiResult.ok(orderService.closeExpired());
+        int closed = orderService.closeExpired();
+        log.info("【超时关单】本轮结果: closed={}；只处理 CREATED 且超过 payTimeout 的订单，"
+                + "抢不到锁或已被支付/取消的订单跳过，下一轮再扫", closed);
+        return ApiResult.ok(closed);
     }
 
     /**
@@ -204,8 +243,11 @@ public class MallController {
      */
     @PostMapping("/ops/outbox/relay")
     public ApiResult<OutboxRelay.RelayReport> relayOutbox() {
-        log.info("【接口】手动触发 outbox 中继");
-        return ApiResult.ok(outboxRelay.relayOnce(Instant.now()));
+        OutboxRelay.RelayReport report = outboxRelay.relayOnce(Instant.now());
+        log.info("【Outbox 中继】本轮结果: 扫描={}, 投递成功={}, 待重试={}, 死信={}；"
+                        + "重复触发不会重发已 SENT 的消息",
+                report.picked(), report.sent(), report.retried(), report.dead());
+        return ApiResult.ok(report);
     }
 
     /**
@@ -217,8 +259,10 @@ public class MallController {
      */
     @PostMapping("/ops/notify")
     public ApiResult<PaymentNotifier.NotifyReport> notifyOnce() {
-        log.info("【接口】手动触发支付通知");
-        return ApiResult.ok(paymentNotifier.notifyOnce(Instant.now()));
+        PaymentNotifier.NotifyReport report = paymentNotifier.notifyOnce(Instant.now());
+        log.info("【支付通知】本轮结果: 扫描={}, 发送成功={}, 待重试={}, 死信={}；重复触发不会重发已成功的任务",
+                report.picked(), report.succeeded(), report.retried(), report.dead());
+        return ApiResult.ok(report);
     }
 
     /**
@@ -226,8 +270,14 @@ public class MallController {
      */
     @GetMapping("/stats")
     public ApiResult<MallStatsService.Snapshot> stats() {
-        log.info("【接口】查询全链路状态快照");
-        return ApiResult.ok(statsService.snapshot());
+        MallStatsService.Snapshot snapshot = statsService.snapshot();
+        log.info("【状态快照】订单={}, 支付={}, outbox(待投递/已投递/死信)={}/{}/{}, "
+                        + "通知(待发/成功/死信)={}/{}/{}, TCC(已Try/已Confirm/已Cancel)={}/{}/{}",
+                snapshot.orders(), snapshot.payments(),
+                snapshot.outboxPending(), snapshot.outboxSent(), snapshot.outboxDead(),
+                snapshot.notifyPending(), snapshot.notifySucceeded(), snapshot.notifyDead(),
+                snapshot.tccTried(), snapshot.tccConfirmed(), snapshot.tccCancelled());
+        return ApiResult.ok(snapshot);
     }
 
     /**

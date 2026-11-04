@@ -21,7 +21,7 @@ import java.util.Optional;
  *
  * <p>【解决什么问题】这是整条 100 万 QPS 链路的入口，只做三件事：取短码、让 Service 解析、
  * 返回 302。它刻意不承担鉴权、限流、统计等职责，因为跳转与管理接口的流量特征完全不同 ——
- * 混在一个 Controller 里会让"只读热路径"被管理逻辑拖慢。
+ * 混在一个 Controller 里会让「只读热路径」被管理逻辑拖慢。
  *
  * <p>【为什么这样设计】为什么返回 302 而不是 301：
  * <ul>
@@ -29,10 +29,10 @@ import java.util.Optional;
  *   <li>短链可能被删除、改指向，301 一旦落到客户端就收不回来。</li>
  * </ul>
  * 这里额外加了 {@code Cache-Control: no-store}：牺牲一点点重复解析，
- * 换取点击统计与"删链立刻生效"两个性质。这是短链业务明确接受的权衡。
+ * 换取点击统计与「删链立刻生效」两个性质。这是短链业务明确接受的权衡。
  *
  * <p>【怎么读这段代码】路由正则 {@code [0-9A-Za-z]{7}} 先完成一次前置过滤，
- * 长度或字符不对的请求根本不会进方法；进方法后只判断"命中/不存在"两条分支。
+ * 长度或字符不对的请求根本不会进方法；进方法后只判断「命中/不存在」两条分支。
  * <b>日志注意</b>：本方法处于百万 QPS 热路径，只能打 debug，
  * 生产环境需要改为采样或完全关闭（详见 {@code ShortlinkService#resolve} 的说明）。
  */
@@ -58,11 +58,11 @@ public class RedirectController {
     @GetMapping("/{code:[0-9A-Za-z]{7}}")
     public ResponseEntity<Void> redirect(@PathVariable("code") String code) {
         // 百万 QPS 热路径：只允许 debug。info 级日志在这里会带来字符串拼接与 IO 竞争，直接成为瓶颈
-        log.debug("跳转请求: code={}", code);
+        log.debug("【短链-跳转】跳转请求：code={}", code);
         Optional<Shortlink> link = shortlinkService.resolveForRedirect(code);
         if (link.isEmpty()) {
             // no-store 让浏览器不缓存 404，删链/重建后的行为更容易预测
-            log.debug("短码未命中，返回 404: code={}", code);
+            log.debug("【短链-跳转】短码未命中，返回 404：code={}", code);
             return ResponseEntity.status(HttpStatus.NOT_FOUND)
                     .cacheControl(CacheControl.noStore())
                     .build();

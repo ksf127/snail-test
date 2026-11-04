@@ -105,12 +105,14 @@ public class StockTccService {
     public TryResult tryReserve(String orderNo, List<OrderLine> lines) {
         for (OrderLine line : lines) {
             if (!tryBranch(orderNo, line)) {
-                log.info("【TCC-Try】失败: orderNo={}, productId={}, quantity={}",
+                log.info("【TCC-Try】失败: orderNo={}, productId={}, quantity={}；判读：商品不存在或可用库存不足（业务性失败），"
+                                + "已 Try 成功的行不在这里回滚，由协调器调 Cancel",
                         orderNo, line.productId(), line.quantity());
                 return TryResult.failed(line.productId());
             }
         }
-        log.info("【TCC-Try】成功: orderNo={}, 预占 {} 行", orderNo, lines.size());
+        log.info("【TCC-Try】成功: orderNo={}, 预占 {} 行；判读：库存已从可用转入冻结，等待 Confirm 扣减或 Cancel 归还",
+                orderNo, lines.size());
         return TryResult.ok();
     }
 
@@ -128,7 +130,8 @@ public class StockTccService {
         for (OrderLine line : lines) {
             confirmBranch(transactionId(orderNo, line.productId()));
         }
-        log.info("【TCC-Confirm】成功: orderNo={}, 确认 {} 行", orderNo, lines.size());
+        log.info("【TCC-Confirm】成功: orderNo={}, 确认 {} 行；判读：已 CONFIRMED 的行幂等跳过，冻结份额已真正扣减",
+                orderNo, lines.size());
     }
 
     /**
@@ -146,7 +149,8 @@ public class StockTccService {
         for (OrderLine line : lines) {
             cancelBranch(transactionId(orderNo, line.productId()), line);
         }
-        log.info("【TCC-Cancel】完成: orderNo={}, 归还 {} 行", orderNo, lines.size());
+        log.info("【TCC-Cancel】完成: orderNo={}, 归还 {} 行；判读：未 Try 的行落空回滚记录，已 CANCELLED 的行幂等跳过",
+                orderNo, lines.size());
     }
 
     /**
@@ -193,26 +197,36 @@ public class StockTccService {
                 if (tx.status() == TccTransaction.Status.TRIED) {
                     // 重复 Try：库存已经预占过，直接返回成功，不能再扣一次
                     idempotentRepeats.increment();
-                    log.debug("TCC Try 重复调用，直接返回成功: txId={}", txId);
+                    log.debug("【TCC-Try】重复调用，幂等返回成功: txId={}；原因=分支已是 TRIED，再预占会扣两次库存",
+                            txId);
                     return true;
                 }
                 if (tx.status() == TccTransaction.Status.CONFIRMED) {
+                    log.debug("【TCC-Try】拒绝: txId={}；原因=分支已 CONFIRMED，Try 晚于 Confirm 属协调器乱序",
+                            txId);
                     throw new IllegalStateException("分支已 Confirm，重复 Try: " + txId);
                 }
                 // 空回滚记录已存在：这次 Try 对应的资源没有 Cancel 会来回收，直接拒绝悬挂
                 suspendedRejections.increment();
-                log.warn("拒绝悬挂的 Try: txId={}", txId);
+                log.warn("【TCC-Try】拒绝悬挂: txId={}；原因=已存在空回滚记录（Cancel 先到），"
+                        + "若允许本次 Try 占住库存，不会再有 Cancel 来回收，库存会被永久冻结", txId);
                 throw new IllegalStateException("分支已空回滚，拒绝悬挂的 Try: " + txId);
             }
             Stock stock = stocks.findById(line.productId()).orElse(null);
             if (stock == null) {
+                log.debug("【TCC-Try】失败: txId={}, productId={}；原因=商品/库存记录不存在",
+                        txId, line.productId());
                 return false;
             }
             if (!stock.reserve(line.quantity())) {
+                log.debug("【TCC-Try】失败: txId={}, quantity={}；原因=可用库存不足，明细见库存预占日志",
+                        txId, line.quantity());
                 return false;
             }
             transactions.save(new TccTransaction(txId, line.productId(), line.quantity(), Instant.now()));
             tried.increment();
+            log.debug("【TCC-Try】分支预占完成: txId={}, productId={}, quantity={}；库存已从可用转入冻结",
+                    txId, line.productId(), line.quantity());
             return true;
         }
     }
@@ -230,15 +244,22 @@ public class StockTccService {
             throw new BizException(ErrorCode.SYSTEM_ERROR, "TCC 分支加锁超时: " + txId);
         }
         try (LockHandle ignored = handle) {
-            TccTransaction tx = transactions.findByTxId(txId)
-                    .orElseThrow(() -> new IllegalStateException("Confirm 找不到 Try 记录: " + txId));
+            Optional<TccTransaction> existing = transactions.findByTxId(txId);
+            if (existing.isEmpty()) {
+                log.warn("【TCC-Confirm】失败: txId={}；原因=找不到 Try 记录，Confirm 先于 Try 到达", txId);
+                throw new IllegalStateException("Confirm 找不到 Try 记录: " + txId);
+            }
+            TccTransaction tx = existing.get();
             if (tx.status() == TccTransaction.Status.CONFIRMED) {
                 // 重复 Confirm：冻结库存已经扣过了，直接幂等返回
                 idempotentRepeats.increment();
-                log.debug("TCC Confirm 重复调用，直接返回: txId={}", txId);
+                log.debug("【TCC-Confirm】重复调用，幂等返回: txId={}；原因=分支已是 CONFIRMED，冻结库存已扣过",
+                        txId);
                 return;
             }
             if (tx.status() == TccTransaction.Status.CANCELLED) {
+                log.warn("【TCC-Confirm】拒绝: txId={}；原因=分支已 CANCELLED，Confirm 晚于 Cancel 属协调器乱序",
+                        txId);
                 throw new IllegalStateException("分支已 Cancel，收到 Confirm: " + txId);
             }
             Stock stock = stocks.findById(tx.productId())
@@ -247,7 +268,8 @@ public class StockTccService {
             tx.markConfirmed();
             transactions.save(tx);
             confirmed.increment();
-            log.debug("TCC Confirm 分支完成: txId={}, quantity={}", txId, tx.quantity());
+            log.debug("【TCC-Confirm】分支完成: txId={}, quantity={}；冻结份额已真正扣减",
+                    txId, tx.quantity());
         }
     }
 
@@ -269,7 +291,8 @@ public class StockTccService {
                 // 空回滚：Cancel 先于 Try 到达。必须留痕，否则稍后补来的 Try 会永久占住库存
                 transactions.save(TccTransaction.emptyRollback(txId, line.productId(), line.quantity(), Instant.now()));
                 emptyRollbacks.increment();
-                log.info("【TCC-Cancel】空回滚，已留痕: txId={}, productId={}, quantity={}",
+                log.info("【TCC-Cancel】空回滚，已留痕: txId={}, productId={}, quantity={}；"
+                                + "原因=Cancel 先于 Try 到达，先落 CANCELLED 记录，后续补来的 Try 会被判为悬挂",
                         txId, line.productId(), line.quantity());
                 return;
             }
@@ -277,12 +300,14 @@ public class StockTccService {
             if (tx.status() == TccTransaction.Status.CANCELLED) {
                 // 重复 Cancel：库存已经归还过，不能再还一次（否则库存越还越多）
                 idempotentRepeats.increment();
-                log.debug("TCC Cancel 重复调用，直接返回: txId={}", txId);
+                log.debug("【TCC-Cancel】重复调用，幂等返回: txId={}；原因=分支已是 CANCELLED，再还会把库存越还越多",
+                        txId);
                 return;
             }
             if (tx.status() == TccTransaction.Status.CONFIRMED) {
                 // Confirm 之后再 Cancel 是协调器乱序，不能静默处理
-                log.error("TCC Cancel 晚于 Confirm，数据不一致: txId={}", txId);
+                log.error("【TCC-Cancel】晚于 Confirm，数据不一致: txId={}；原因=分支已 CONFIRMED，"
+                        + "此时归还等于把已售库存凭空加回可用，直接拒绝", txId);
                 throw new IllegalStateException("分支已 Confirm，收到 Cancel: " + txId);
             }
             Stock stock = stocks.findById(tx.productId())
@@ -291,7 +316,8 @@ public class StockTccService {
             tx.markCancelled();
             transactions.save(tx);
             cancelled.increment();
-            log.debug("TCC Cancel 分支完成: txId={}, quantity={}", txId, tx.quantity());
+            log.debug("【TCC-Cancel】分支完成: txId={}, quantity={}；冻结份额已退回可用",
+                    txId, tx.quantity());
         }
     }
 

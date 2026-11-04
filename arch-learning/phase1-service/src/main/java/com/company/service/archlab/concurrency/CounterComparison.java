@@ -1,6 +1,7 @@
 package com.company.service.archlab.concurrency;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -181,10 +182,22 @@ public class CounterComparison {
      */
     public List<Result> runAll(int threads, long incrementsPerThread) {
         List<Result> results = new ArrayList<>();
+        log.info("【计数器对比】测什么：同一个 count++ 问题，五种同步手段的正确性与吞吐；"
+                + "谁和谁对照：PLAIN（对照组，必然丢更新）vs 其余四种（正确性应全为 true）；"
+                + "参数：线程数={}，每线程自增={}次", threads, incrementsPerThread);
         // 串行跑而不是并发跑：同时跑五个实验会互相抢 CPU，数字就没法比较了
         for (Strategy strategy : Strategy.values()) {
             results.add(run(strategy, threads, incrementsPerThread));
         }
+        // 汇总一次按耗时排序：单看每条日志无法回答"到底该选哪个"，
+        // 只有把五个数字排在一行里，优劣才是可比的
+        List<Result> ranked = new ArrayList<>(results);
+        ranked.sort(Comparator.comparingLong(Result::elapsedMillis));
+        log.info("【计数器对比】判读：正确性 {}，耗时从快到慢 {}",
+                results.stream().allMatch(Result::correct) ? "全部正确" : "存在丢更新（符合 PLAIN 预期）",
+                ranked.stream()
+                        .map(r -> r.strategy() + "=" + r.elapsedMillis() + "ms")
+                        .toList());
         return results;
     }
 

@@ -46,21 +46,40 @@ public class LegacyValidationService {
                 context.userId(), context.skuId(), context.quantity());
         // 规则 1：userId 非空。用户在方法内部被复制了一份，其它入口要用还得再抄一遍
         if (context.userId() == null || context.userId().isBlank()) {
-            throw new BizException(ErrorCode.PARAM_INVALID, "userId 不能为空");
+            throw fail("userId 非空", ErrorCode.PARAM_INVALID, "userId 不能为空");
         }
         // 规则 2：封禁判断。错误信息里没有 userId，线上只能去别处反查是谁
         if (context.userId().startsWith("blocked")) {
-            throw new BizException(ErrorCode.FORBIDDEN, "用户已被封禁");
+            throw fail("用户未封禁", ErrorCode.FORBIDDEN, "用户已被封禁");
         }
         // 规则 3：数量区间。魔法值 100 直接写死，阈值一改就要全仓库搜
         if (context.quantity() <= 0 || context.quantity() > 100) {
-            throw new BizException(ErrorCode.PARAM_INVALID, "购买数量不合法");
+            throw fail("数量在 (0, 100]", ErrorCode.PARAM_INVALID, "购买数量不合法");
         }
         if (context.skuId() == null || context.skuId().isBlank()) {
-            throw new BizException(ErrorCode.PARAM_INVALID, "skuId 不能为空");
+            throw fail("skuId 非空", ErrorCode.PARAM_INVALID, "skuId 不能为空");
         }
         if (context.skuId().startsWith("soldout")) {
-            throw new BizException(ErrorCode.CONFLICT, "商品库存不足");
+            throw fail("商品有库存", ErrorCode.CONFLICT, "商品库存不足");
         }
+        // Legacy 版只能在这里打一条笼统的"通过"：分不清哪条规则跑过、各用了多久。
+        // 这正是对照点——ValidationChain 那边每个节点都有一条 debug 轨迹
+        log.debug("【Legacy 校验】全部规则通过（共 5 条，无法分辨单条执行情况）");
+    }
+
+    /**
+     * 组装异常并补一条失败日志，让 Legacy 侧至少能看出"挂在哪条规则"。
+     *
+     * <p>这里刻意做成"返回异常"而不是"打日志 + throw"两句：
+     * 调用点仍然是一行 {@code throw fail(...)}，保持 if 结构一眼可读。
+     *
+     * @param rule    失败的是哪条规则
+     * @param code    对应的业务错误码
+     * @param message 抛给调用方的原因
+     * @return 待抛出的异常
+     */
+    private BizException fail(String rule, ErrorCode code, String message) {
+        log.warn("【Legacy 校验】规则「{}」不通过，原因={}", rule, message);
+        return new BizException(code, message);
     }
 }

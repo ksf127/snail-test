@@ -2,6 +2,8 @@ package com.company.service.shortlink.support;
 
 import com.company.service.shortlink.domain.BloomFilter;
 import com.company.service.shortlink.domain.Shortlink;
+import com.company.service.shortlink.infra.MemoryBloomFilter;
+import com.company.service.shortlink.infra.RedisBloomFilter;
 import com.company.service.shortlink.infra.ShortlinkRepository;
 
 import org.slf4j.Logger;
@@ -18,7 +20,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * 启动时用存量数据重建布隆位图。
  *
  * <p>【解决什么问题】内存版布隆过滤器的位图挂在 JVM 里，进程一重启就全空。
- * 如果重启后直接对外服务，所有历史短码都会被判定为"一定不存在"，
+ * 如果重启后直接对外服务，所有历史短码都会被判定为「一定不存在」，
  * 线上表现为整站 404 —— 而且日志里一条数据库错误都没有，排查方向很容易跑偏。
  * 这个类在应用就绪后把存量短码重新灌进位图，消除这个空窗。
  *
@@ -28,7 +30,7 @@ import java.util.concurrent.atomic.AtomicLong;
  *       此时所有 Bean 已装配完毕、端口已就绪，预热用的是完整可用的组件；</li>
  *   <li>为什么只跑一次：用 CAS 抢占 {@code executed}，重复触发（事件重放、手动调用）
  *       不会重复灌入，也不会因为并发而重复计数；</li>
- *   <li>为什么这里是同步全量：为了让"热身 / 不热身"的对照实验可以随时复现。
+ *   <li>为什么这里是同步全量：为了让「热身 / 不热身」的对照实验可以随时复现。
  *       真实系统不会同步全量重建，而是：Redis 布隆持久化 + 从库分批预热 +
  *       高并发期间临时放行（预热完成前先让请求穿透到缓存/存储，而不是直接返回 404）。</li>
  * </ul>
@@ -77,19 +79,55 @@ public class BloomWarmUp {
      */
     public long warmUp() {
         if (!executed.compareAndSet(false, true)) {
-            log.debug("布隆位图预热已执行过，跳过: 已预热 {} 条", warmed.get());
+            log.debug("【短链-布隆预热】布隆位图预热已执行过，跳过：已预热 {} 条", warmed.get());
             return warmed.get();
         }
         long start = System.nanoTime();
         List<Shortlink> links = repository.findAll();
+        // 两种内置实现都暴露了位图参数，直接读取即可；不改 BloomFilter 接口，
+        // 是为了让预热器继续只依赖「加元素 / 查元素」两个能力
+        long bitSize = 0L;
+        int hashCount = 0;
+        if (filter instanceof MemoryBloomFilter memory) {
+            bitSize = memory.bitSize();
+            hashCount = memory.hashCount();
+        } else if (filter instanceof RedisBloomFilter redis) {
+            bitSize = redis.bitSize();
+            hashCount = redis.hashCount();
+        }
+        // 预热前对照：本次预热写入 0 条。内存版此时位图全为 0，存量短码会被全部判为「一定不存在」
+        log.info("【短链-布隆预热】预热前：本次写入 0 条，位数组 {} bit（约 {} KB），占用 0.0%，预计误判率 0.0%；"
+                        + "内存版此时位图全空，存量短码跳转会全部 404",
+                bitSize, bitSize / 8_192);
         // 注意：这里是在启动阶段同步遍历，数据量大时会拉长启动时间；
         // 生产环境应改成分批从从库读取，避免一次性把主库和内存打满
         for (Shortlink link : links) {
             filter.add(link.code());
         }
         warmed.set(links.size());
-        log.info("布隆位图预热完成: {} 条，耗时 {} ms", links.size(), (System.nanoTime() - start) / 1_000_000);
+        long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+        if (bitSize > 0) {
+            // 布隆占用率 fill = 1 - e^(-k*n/m)，误判率 p ≈ fill^k（标准布隆公式）
+            double fill = 1.0 - Math.exp(-(double) hashCount * links.size() / bitSize);
+            double falsePositive = Math.pow(fill, hashCount);
+            log.info("【短链-布隆预热】预热后：写入 {} 条，位数组 {} bit（约 {} KB），占用 {}%，预计误判率 {}%；耗时 {} ms",
+                    links.size(), bitSize, bitSize / 8_192, percent(fill), percent(falsePositive), elapsedMillis);
+            log.info("【短链-布隆预热】判读：预热后无效 key 会在布隆层被拦下，不打到缓存和 DB；"
+                            + "{} 条只占位图 {}%，预计每 1 万次随机查询约 {} 次假阳性穿透到缓存",
+                    links.size(), percent(fill), Math.round(falsePositive * 10_000d));
+        } else {
+            log.info("【短链-布隆预热】预热后：写入 {} 条，耗时 {} ms（当前实现未暴露位图参数，跳过占用与误判率估算）",
+                    links.size(), elapsedMillis);
+            log.info("【短链-布隆预热】判读：预热后无效 key 会在布隆层被拦下，不打到缓存和 DB");
+        }
         return links.size();
+    }
+
+    /**
+     * 百分比保留两位小数，避免日志里出现一长串浮点尾数。
+     */
+    private static double percent(double ratio) {
+        return Math.round(ratio * 1_000_000d) / 10_000d;
     }
 
     /**

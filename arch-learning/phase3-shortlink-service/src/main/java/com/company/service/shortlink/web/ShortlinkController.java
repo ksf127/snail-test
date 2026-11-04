@@ -27,7 +27,7 @@ import org.springframework.web.bind.annotation.RestController;
 /**
  * 管理接口：创建 / 查询 / 删除 / 点击量 / 运行计数 / 容量模型。
  *
- * <p>【解决什么问题】短链系统的"控制面"：创建和删除是低频写，统计与容量模型是观察窗口。
+ * <p>【解决什么问题】短链系统的「控制面」：创建和删除是低频写，统计与容量模型是观察窗口。
  * 它和跳转入口分开，是因为两者的流量差了几个数量级 —— 管理接口可以做完整校验和 info 日志，
  * 跳转接口则必须克制到只剩 debug。
  *
@@ -39,7 +39,7 @@ import org.springframework.web.bind.annotation.RestController;
  *   <li>容量模型接口带默认参数（100 万 QPS），打开就能看到 L1 命中率对 Redis 压力的敏感度。</li>
  * </ul>
  *
- * <p>【怎么读这段代码】从上到下是"写 → 读 → 删 → 点击量 → 刷盘 → 统计 → 容量"，
+ * <p>【怎么读这段代码】从上到下是「写 → 读 → 删 → 点击量 → 刷盘 → 统计 → 容量」，
  * 每个方法只做参数转发与 DTO 转换，业务判断都在 {@link ShortlinkService}。
  * 本类无可变状态，线程安全。
  */
@@ -66,7 +66,7 @@ public class ShortlinkController {
      */
     @PostMapping
     public ApiResult<ShortlinkView> create(@Valid @RequestBody CreateShortlinkRequest request) {
-        log.info("创建短链请求: url={}, expireAt={}", request.url(), request.expireAt());
+        log.info("【短链-管理】创建短链请求：url={}, expireAt={}", request.url(), request.expireAt());
         Shortlink link = shortlinkService.create(request.url(), request.expireAt());
         return ApiResult.ok(ShortlinkView.from(link, shortlinkService.shortUrl(link.code())));
     }
@@ -85,7 +85,7 @@ public class ShortlinkController {
      */
     @GetMapping("/{code:[0-9A-Za-z]{7}}")
     public ApiResult<ShortlinkView> get(@PathVariable("code") String code) {
-        log.debug("查询短链请求: code={}", code);
+        log.debug("【短链-管理】查询短链请求：code={}", code);
         Shortlink link = shortlinkService.resolve(code)
                 .orElseThrow(() -> new BizException(ErrorCode.NOT_FOUND, "短码不存在或已过期: " + code));
         return ApiResult.ok(ShortlinkView.from(link, shortlinkService.shortUrl(link.code())));
@@ -100,7 +100,7 @@ public class ShortlinkController {
      */
     @DeleteMapping("/{code:[0-9A-Za-z]{7}}")
     public ApiResult<Void> delete(@PathVariable("code") String code) {
-        log.info("删除短链请求: code={}", code);
+        log.info("【短链-管理】删除短链请求：code={}", code);
         if (!shortlinkService.delete(code)) {
             throw new BizException(ErrorCode.NOT_FOUND, "短码不存在: " + code);
         }
@@ -115,18 +115,18 @@ public class ShortlinkController {
      */
     @GetMapping("/{code:[0-9A-Za-z]{7}}/clicks")
     public ApiResult<Long> clicks(@PathVariable("code") String code) {
-        log.debug("查询点击量请求: code={}", code);
+        log.debug("【短链-管理】查询点击量请求：code={}", code);
         return ApiResult.ok(shortlinkService.clicks(code));
     }
 
     /**
-     * 手动刷一次点击增量。线上靠定时任务，这里留给实验观察"刷之前/刷之后"的差异。
+     * 手动刷一次点击增量。线上靠定时任务，这里留给实验观察「刷之前/刷之后」的差异。
      *
      * <p>触发一次批量落盘，属于低频关键动作，用 info 留痕。
      */
     @PostMapping("/clicks/flush")
     public ApiResult<Void> flushClicks() {
-        log.info("手动触发点击增量刷盘");
+        log.info("【短链-管理】手动触发点击增量刷盘");
         shortlinkService.flushClicks();
         return ApiResult.ok(null);
     }
@@ -138,14 +138,14 @@ public class ShortlinkController {
      */
     @GetMapping("/stats")
     public ApiResult<ShortlinkStatsView> stats() {
-        log.debug("查询运行计数");
+        log.debug("【短链-管理】查询运行计数");
         return ApiResult.ok(ShortlinkStatsView.from(shortlinkService.stats()));
     }
 
     /**
      * 容量模型：给出目标 QPS 下需要多少节点、各层实际 QPS 与利用率。
      *
-     * <p>默认参数就是 100 万 QPS 场景，可直接看到"L1 命中率"对 Redis 的压力有多敏感。
+     * <p>默认参数就是 100 万 QPS 场景，可直接看到「L1 命中率」对 Redis 的压力有多敏感。
      *
      * @param targetQps           目标总 QPS
      * @param l1HitRatio          L1 命中率（分母是全部请求）
@@ -164,9 +164,20 @@ public class ShortlinkController {
             @RequestParam(name = "singleNodeQps", defaultValue = "150000") long singleNodeQps,
             @RequestParam(name = "redisQpsCapacity", defaultValue = "500000") long redisQpsCapacity,
             @RequestParam(name = "dbQpsCapacity", defaultValue = "100000") long dbQpsCapacity) {
-        log.debug("容量模型计算: targetQps={}, l1HitRatio={}, l2HitRatioOfL1Miss={}",
+        log.debug("【短链-管理】容量模型计算：targetQps={}, l1HitRatio={}, l2HitRatioOfL1Miss={}",
                 targetQps, l1HitRatio, l2HitRatioOfL1Miss);
-        return ApiResult.ok(CapacityModel.plan(new CapacityModel.Workload(
-                targetQps, l1HitRatio, l2HitRatioOfL1Miss, singleNodeQps, redisQpsCapacity, dbQpsCapacity)));
+        CapacityModel.Plan plan = CapacityModel.plan(new CapacityModel.Workload(
+                targetQps, l1HitRatio, l2HitRatioOfL1Miss, singleNodeQps, redisQpsCapacity, dbQpsCapacity));
+        // 判读必须放在计算之后：只看入参回答不了「这套配置扛不扛得住」，要把节点数与两层利用率一起说出来
+        log.info("【短链-管理】容量判读：目标 QPS={}，需要 {} 个节点（分片），单机 {} QPS、平均每节点 {} QPS；"
+                        + "L1 接住 {}，L2 承担 {}（Redis 利用率 {}），存储承担 {}（存储利用率 {}）→ {}",
+                plan.targetQps(), plan.nodes(), singleNodeQps, plan.qpsPerNode(),
+                plan.l1Qps(), plan.l2Qps(), plan.redisUtilization(),
+                plan.dbQps(), plan.dbUtilization(),
+                plan.feasible() ? "两层均在 70% 安全水位内，当前配置够用" : "至少一层超过 70% 安全水位，需要扩容或分片");
+        if (!plan.warnings().isEmpty()) {
+            log.warn("【短链-管理】容量告警：{}", plan.warnings());
+        }
+        return ApiResult.ok(plan);
     }
 }

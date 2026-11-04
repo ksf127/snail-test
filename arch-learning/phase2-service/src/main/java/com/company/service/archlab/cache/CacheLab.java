@@ -120,7 +120,10 @@ public class CacheLab {
             throw new IllegalArgumentException("mode 不能为空");
         }
 
-        log.info("【穿透实验】开始，requests={}，mode={}，查询不存在的 id={}", requests, mode, MISSING_ID);
+        log.info("【穿透实验】测什么：用数据库里不存在的 id={} 连续查 {} 次，看缓存层能不能挡住穿透流量；"
+                        + "谁和谁对照：A组 NAIVE（不防护）vs B组 NULL_CACHE（空值哨兵）vs C组 BLOOM（位图前置拦截）；"
+                        + "本次跑 {}（{}），TTL={}s",
+                MISSING_ID, requests, mode, penetrationGroupLabel(mode), LAB_TTL.toSeconds());
         // 每个实验独立造一个"数据库"，回源计数只统计本次实验。
         ProductRepository repository = new ProductRepository(0);
         long start = System.nanoTime();
@@ -157,9 +160,22 @@ public class CacheLab {
 
         PenetrationResult result = new PenetrationResult(mode.name(), requests,
                 repository.loadCount(), rejected, elapsed(start));
-        log.info("【穿透实验】结束，mode={}，请求={}，回源 DB={} 次，布隆拦截={} 次，" +
-                        "结论：{}",
-                mode, requests, result.dbLoads(), result.bloomRejected(), penetrationConclusion(mode));
+        log.info("【穿透实验】{}｜结果：请求 {} 次，回源 DB {} 次，布隆拦截 {} 次，耗时 {}ms",
+                penetrationGroupLabel(mode), requests, result.dbLoads(), result.bloomRejected(),
+                result.elapsedMillis());
+        if (mode == PenetrationMode.NAIVE) {
+            log.info("【穿透实验】判读：A组回源 {} 次 = 请求数 {}，说明不防护时穿透流量 1:1 打到数据库，"
+                            + "脏参数或爬虫构造的随机 id 会把连接池直接打满",
+                    result.dbLoads(), requests);
+        } else if (mode == PenetrationMode.NULL_CACHE) {
+            log.info("【穿透实验】判读：B组回源 {} 次（首次回源后命中空值哨兵），比 A组 的 {} 次少 {} 次；"
+                            + "代价是缓存里多存了空值，必须配短 TTL 防止长期占位",
+                    result.dbLoads(), requests, requests - result.dbLoads());
+        } else {
+            log.info("【穿透实验】判读：C组布隆拦截 {} 次、回源 {} 次；位图判断「不存在」是确定性的，"
+                            + "不会误杀真实数据，代价是极低误判率与位图维护成本",
+                    result.bloomRejected(), result.dbLoads());
+        }
         return result;
     }
 
@@ -183,7 +199,10 @@ public class CacheLab {
             throw new IllegalArgumentException("mode 不能为空");
         }
 
-        log.info("【击穿实验】开始，threads={}，loadMillis={}，mode={}", threads, loadMillis, mode);
+        log.info("【击穿实验】测什么：热点 key 刚失效的瞬间，{} 个线程同时读同一个 key，看有多少次真的回源；"
+                        + "谁和谁对照：A组 NAIVE（不设防护，直接查库）vs B组 SINGLE_FLIGHT（按 key 收敛回源）；"
+                        + "本次跑 {}（{}），单次查库耗时={}ms",
+                threads, breakdownGroupLabel(mode), mode, loadMillis);
         ProductRepository repository = new ProductRepository(loadMillis);
         MultiLevelProductCache cache = newCache(repository, true, 1024, LAB_TTL, 0);
 
@@ -219,9 +238,23 @@ public class CacheLab {
         }
         BreakdownResult result = new BreakdownResult(mode.name(), threads,
                 repository.loadCount(), elapsed(start));
-        log.info("【击穿实验】结束，mode={}，并发={}，回源 DB={} 次，耗时={}ms。" +
-                        "SINGLE_FLIGHT 下应接近 1 次；NAIVE 下接近并发数",
-                mode, threads, result.dbLoads(), result.elapsedMillis());
+        log.info("【击穿实验】{}｜结果：并发 {}，回源 DB {} 次，耗时 {}ms",
+                breakdownGroupLabel(mode), threads, result.dbLoads(), result.elapsedMillis());
+        if (mode == BreakdownMode.SINGLE_FLIGHT) {
+            if (result.dbLoads() <= 1L) {
+                log.info("【击穿实验】判读：B组把并发回源收敛成 {} 次，其余线程在锁内复查后直接命中缓存，"
+                                + "热点 key 过期瞬间不会把数据库压垮",
+                        result.dbLoads());
+            } else {
+                log.warn("【击穿实验】判读：B组仍回源 {} 次（并发 {}），说明单飞没生效，"
+                                + "请检查线程是否真的同时到达屏障，或加大 threads/loadMillis 重跑",
+                        result.dbLoads(), threads);
+            }
+        } else {
+            log.info("【击穿实验】判读：A组回源 {} 次，接近并发数 {} —— 缓存刚失效时每个线程都查了一次库，"
+                            + "这就是击穿，数据库会被瞬时并发打满",
+                    result.dbLoads(), threads);
+        }
         return result;
     }
 
@@ -244,7 +277,10 @@ public class CacheLab {
         requireBetween("keys", keys, 1, 50);
         requireBetween("baseTtlMillis", baseTtlMillis, 50, 5_000);
 
-        log.info("【雪崩实验】开始，keys={}，baseTtlMillis={}，jitter={}", keys, baseTtlMillis, jitter);
+        log.info("【雪崩实验】测什么：批量预热 {} 个 key 后等基础 TTL={}ms 到期，看有多少 key 同时回源；"
+                        + "谁和谁对照：A组 jitter=false（固定 TTL，同时过期）vs B组 jitter=true（TTL 加 0~25% 抖动）；"
+                        + "本次跑 {}，jitter={}，L1 关闭以保证每次读都落到 L2",
+                keys, baseTtlMillis, jitter ? "B组" : "A组", jitter);
         ProductRepository repository = new ProductRepository(0);
         // L1 关闭、L1 TTL 设成 1ms：目的就是让每次读都穿透到 L2，观察 key 是否真的过期。
         MultiLevelProductCache cache = newCache(repository, false, 0, Duration.ofMillis(1), jitter ? 0.25 : 0);
@@ -268,9 +304,17 @@ public class CacheLab {
         }
         long reloads = repository.loadCount() - afterWarmup;
         AvalancheResult result = new AvalancheResult(jitter, keys, reloads, elapsed(start));
-        log.info("【雪崩实验】结束，jitter={}，key 数={}，过期后回源 DB={} 次，耗时={}ms。" +
-                        "抖动越大，回源越分散",
-                jitter, keys, reloads, result.elapsedMillis());
+        log.info("【雪崩实验】{}｜结果：key 数 {}，过期后回源 DB {} 次，耗时 {}ms",
+                jitter ? "B组 jitter=true" : "A组 jitter=false", keys, reloads, result.elapsedMillis());
+        if (jitter) {
+            log.info("【雪崩实验】判读：B组回源 {} 次 < key 数 {}，说明抖动把过期时刻拉开了，"
+                            + "回源被摊平到一段时间里；抖动只延后过期、不提前，命中率不会因此下降",
+                    reloads, keys);
+        } else {
+            log.info("【雪崩实验】判读：A组回源 {} 次 ≈ key 数 {}，所有 key 在同一时刻失效、同一时刻回源，"
+                            + "这就是雪崩；生产上批量预热必须给 TTL 加随机抖动",
+                    reloads, keys);
+        }
         return result;
     }
 
@@ -289,7 +333,9 @@ public class CacheLab {
     public HotKeyResult hotKey(int requests, boolean l1Enabled) {
         requireBetween("requests", requests, 1, 200_000);
 
-        log.info("【热点实验】开始，requests={}，l1Enabled={}", requests, l1Enabled);
+        log.info("【热点实验】测什么：{} 次请求里 90% 打同一个热点 key、10% 打长尾 key，看命中结构如何被 L1 吸收；"
+                        + "谁和谁对照：A组 l1Enabled=false（只有 L2）vs B组 l1Enabled=true（L1+L2）；本次跑 {}，l1Enabled={}",
+                requests, l1Enabled ? "B组" : "A组", l1Enabled);
         ProductRepository repository = new ProductRepository(0);
         MultiLevelProductCache cache = newCache(repository, l1Enabled, 1024, LAB_TTL, 0);
 
@@ -307,10 +353,18 @@ public class CacheLab {
                 snapshot.loads(),
                 snapshot.l1HitRate(),
                 elapsed(start));
-        log.info("【热点实验】结束，l1Enabled={}，请求={}，L1 命中={}，L2 命中={}，回源 DB={}，" +
-                        "L1 命中率={}，耗时={}ms",
-                l1Enabled, requests, result.l1Hits(), result.l2Hits(), result.dbLoads(),
-                String.format("%.2f", result.l1HitRate()), result.elapsedMillis());
+        log.info("【热点实验】{}｜结果：请求 {}，L1 命中 {}，L2 命中 {}，回源 DB {}，L1 命中率={}，耗时 {}ms",
+                l1Enabled ? "B组" : "A组", requests, result.l1Hits(), result.l2Hits(),
+                result.dbLoads(), String.format("%.2f", result.l1HitRate()), result.elapsedMillis());
+        if (l1Enabled) {
+            log.info("【热点实验】判读：B组 L1 命中率={}，90% 的热点流量在进程内就被消化，"
+                            + "L2/Redis 只承接长尾请求；这就是本地缓存挡热点的价值",
+                    String.format("%.2f", result.l1HitRate()));
+        } else {
+            log.info("【热点实验】判读：A组没有 L1，{} 次请求全部压到 L2，热点 key 所在分片的带宽和 CPU "
+                            + "会成为瓶颈；一旦该分片抖动，所有热点读请求一起超时",
+                    requests);
+        }
         return result;
     }
 
@@ -331,12 +385,22 @@ public class CacheLab {
                 jitterRatio);
     }
 
-    private static String penetrationConclusion(PenetrationMode mode) {
+    /**
+     * 给日志用的组名：让每条日志都能一眼看出当前是哪种策略，而不是只看到一个枚举值。
+     */
+    private static String penetrationGroupLabel(PenetrationMode mode) {
         return switch (mode) {
-            case NAIVE -> "没有防护，每个不存在的 id 都打一次库";
-            case NULL_CACHE -> "空值哨兵让后续请求在缓存层就被挡住";
-            case BLOOM -> "布隆过滤器在缓存之前拦截，位图判断不会误杀真实存在的数据";
+            case NAIVE -> "A组 NAIVE（无防护）";
+            case NULL_CACHE -> "B组 NULL_CACHE（空值哨兵）";
+            case BLOOM -> "C组 BLOOM（布隆过滤）";
         };
+    }
+
+    /**
+     * 给日志用的组名：A组是不设防的写法，B组是单飞收敛后的写法。
+     */
+    private static String breakdownGroupLabel(BreakdownMode mode) {
+        return mode == BreakdownMode.SINGLE_FLIGHT ? "B组 SINGLE_FLIGHT（单飞）" : "A组 NAIVE（无防护）";
     }
 
     private static long elapsed(long startNanos) {

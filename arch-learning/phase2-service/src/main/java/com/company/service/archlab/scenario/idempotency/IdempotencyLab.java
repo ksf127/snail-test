@@ -101,7 +101,10 @@ public class IdempotencyLab {
             throw new IllegalArgumentException("requests 必须在 [1, 200] 之间");
         }
 
-        log.info("【幂等实验】开始，mode={}，订单号={}，并发提交={}", mode, ORDER_NO, concurrentRequests);
+        log.info("【幂等实验】测什么：同一个订单号 {} 被 {} 个请求并发提交，统计真实执行业务动作的次数；"
+                        + "谁和谁对照：NONE（裸接口）vs TOKEN（SETNX 防重）vs UNIQUE_INDEX（唯一索引兜底）"
+                        + "vs STATE_MACHINE（状态机幂等应答）；本次跑 {}",
+                ORDER_NO, concurrentRequests, mode);
         // 下面三个容器分别模拟：Redis 令牌、数据库唯一索引、业务状态行。
         ConcurrentHashMap<String, Boolean> tokens = new ConcurrentHashMap<>();
         ConcurrentHashMap<String, Boolean> orderIndex = new ConcurrentHashMap<>();
@@ -185,12 +188,36 @@ public class IdempotencyLab {
                 success.get(),
                 rejected.get(),
                 TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos));
-        log.info("【幂等实验】结束，mode={}，请求={}，真实执行业务={} 次，成功应答={}，拒绝={}，耗时={}ms",
+        log.info("【幂等实验】{}｜结果：请求 {}，真实执行业务 {} 次，成功应答 {}，拒绝 {}，耗时 {}ms",
                 mode, concurrentRequests, result.businessExecutions(), result.successResponses(),
                 result.rejected(), result.elapsedMillis());
-        if (result.businessExecutions() > 1) {
-            log.warn("【幂等实验】{} 模式下业务被执行了 {} 次，真实环境就是重复扣款",
+        if (mode != Mode.NONE && result.businessExecutions() > 1) {
+            log.warn("【幂等实验】判读：{} 组真实执行 {} 次 > 1，说明防护没有覆盖住并发窗口，"
+                            + "真实环境就是重复扣款，必须排查防护是否生效",
                     mode, result.businessExecutions());
+        } else {
+            switch (mode) {
+                case NONE -> {
+                    if (result.businessExecutions() > 1) {
+                        log.warn("【幂等实验】判读：NONE 组业务执行 {} 次 = 请求数 {}，每次点击或重试都真的扣了一次款；"
+                                        + "线上表现是对账时发现库存少了或账多了",
+                                result.businessExecutions(), concurrentRequests);
+                    } else {
+                        log.info("【幂等实验】判读：NONE 组本次只有 1 个请求，看不出重复执行；"
+                                        + "把并发数调到 10 以上才能复现重复扣款");
+                    }
+                }
+                case TOKEN -> log.info("【幂等实验】判读：TOKEN 组真实执行 {} 次、拒绝 {} 次 —— SETNX 让并发的同一个令牌"
+                                + "只成功一次；但它只覆盖同一次提交，令牌丢失或客户端绕过仍会重复",
+                        result.businessExecutions(), result.rejected());
+                case UNIQUE_INDEX -> log.info("【幂等实验】判读：UNIQUE_INDEX 组真实执行 {} 次、拒绝 {} 次 —— "
+                                + "约束落在数据层，即使上层漏防也能在写库时挡住重复；"
+                                + "代价是冲突会抛异常，要转成可读的业务提示",
+                        result.businessExecutions(), result.rejected());
+                case STATE_MACHINE -> log.info("【幂等实验】判读：STATE_MACHINE 组真实执行 {} 次、成功应答 {} 次、拒绝 {} 次 —— "
+                                + "重复回调走「已支付」分支幂等返回成功，所以成功数大于 1 并不代表重复扣款",
+                        result.businessExecutions(), result.successResponses(), result.rejected());
+            }
         }
         return result;
     }

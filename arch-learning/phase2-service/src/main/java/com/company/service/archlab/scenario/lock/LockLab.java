@@ -74,8 +74,9 @@ public class LockLab {
             throw new IllegalArgumentException("iterations 必须在 [1, 1000] 之间");
         }
 
-        log.info("【分布式锁实验】开始，provider={}，locked={}，threads={}，每线程自增={} 次",
-                distributedLock.provider(), locked, threads, incrementsPerThread);
+        log.info("【分布式锁实验】测什么：{} 个线程各做 {} 次「读 → 业务耗时 → 写回」，看最终计数是否等于期望值；"
+                        + "谁和谁对照：A组 locked=true（{} 分布式锁）vs B组 locked=false（裸自增）；本次跑 {}",
+                threads, incrementsPerThread, distributedLock.provider(), locked ? "A组 有锁" : "B组 无锁");
         Counter counter = new Counter();
         ExecutorService pool = Executors.newFixedThreadPool(threads);
         List<Future<?>> futures = new ArrayList<>(threads);
@@ -115,11 +116,28 @@ public class LockLab {
                 (long) threads * incrementsPerThread,
                 counter.value,
                 TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start));
-        log.info("【分布式锁实验】结束，locked={}，期望={}，实际={}，耗时={}ms",
-                locked, result.expected(), result.actual(), result.elapsedMillis());
-        if (result.actual() != result.expected()) {
-            log.warn("【分布式锁实验】计数丢了 {} 次，说明读-改-写没有被互斥保护",
-                    result.expected() - result.actual());
+        log.info("【分布式锁实验】{}｜结果：期望={}，实际={}，耗时={}ms",
+                locked ? "A组 有锁" : "B组 无锁", result.expected(), result.actual(),
+                result.elapsedMillis());
+        if (!locked) {
+            if (result.actual() != result.expected()) {
+                log.warn("【分布式锁实验】判读：B组（无锁）丢了 {} 次更新 —— 两个线程可能读到同一个旧值，"
+                                + "各自加 1 再写回，后写覆盖先写；单机可以靠 synchronized，多实例只能靠分布式锁或原子 INCR",
+                        result.expected() - result.actual());
+            } else {
+                log.warn("【分布式锁实验】判读：B组（无锁）本轮没有丢更新，通常是并发窗口没撞上，"
+                                + "加大 threads 或 incrementsPerThread 重跑才能复现");
+            }
+        } else {
+            if (result.actual() == result.expected()) {
+                log.info("【分布式锁实验】判读：A组（有锁）实际值严格等于期望值 {}，每次「读-改-写」都在锁内完成；"
+                                + "代价是每次自增两次 Redis 往返，吞吐明显低于原子 INCR",
+                        result.expected());
+            } else {
+                log.warn("【分布式锁实验】判读：A组（有锁）仍丢了 {} 次更新，说明临界区没有覆盖完整的读-改-写，"
+                                + "请检查锁 key 是否一致、锁是否真的生效",
+                        result.expected() - result.actual());
+            }
         }
         return result;
     }
