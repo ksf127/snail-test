@@ -1,5 +1,7 @@
 package com.company.service.archlab.concurrency;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -241,6 +243,90 @@ public class VisibilityDemo {
         }
         return new HoistResult(useVolatile, sawWrite, actualSpins, HOIST_SPIN_LIMIT,
                 settleMillis, elapsedMillis);
+    }
+
+    /**
+     * 【对照组】同一套循环分别用普通字段和 volatile 字段各跑若干轮，统计各自
+     * "跑满上限才退出"的次数，直接回答"不加 volatile 的那组是不是更容易卡死"。
+     *
+     * <p>【为什么需要这个实验】单跑一次看不出规律：普通字段那一组的结果取决于
+     * C2 有没有把读提出循环，第一次可能"碰巧"通过，之后就永远卡住。
+     * 只有反复跑、数出频次，"更容易"这个说法才有依据。
+     *
+     * <p>【为什么两组要交替跑】如果先把普通字段跑 3 轮、再跑 volatile 3 轮，
+     * 前者会先触发 JIT 编译，后者继承了一个已经热起来的 JVM，条件不对等。
+     * 交替执行让两种实现经历同样的编译状态，对比才成立。
+     *
+     * <p>【预期】普通字段的 {@code plainStuck} 接近 {@code trials}（前面一两轮
+     * 可能还在解释执行，之后 C2 完成提升就再也不看内存了）；
+     * volatile 的 {@code volatileStuck} 恒为 0，因为 volatile 读禁止被提升。
+     *
+     * <p>【耗时提醒】每一轮约等于 {@code settleMillis + 0.2s}，两组加起来
+     * 总共 {@code 2 * trials * (settleMillis + 0.2s)}。默认参数大约 13 秒，属正常。
+     *
+     * @param settleMillis 每轮置位前留给 JIT 的时间，取值 [1, 5000]
+     * @param trials       每组的轮数，取值 [1, 5]
+     * @return 两组的明细与"卡死"次数统计
+     * @throws IllegalArgumentException 参数越界
+     * @throws IllegalStateException    等待过程中被中断
+     */
+    public CompareResult compareHoisting(long settleMillis, int trials) {
+        if (settleMillis < 1L || settleMillis > 5_000L) {
+            throw new IllegalArgumentException("settleMillis 必须落在 [1, 5000]");
+        }
+        if (trials < 1 || trials > 5) {
+            throw new IllegalArgumentException("trials 必须落在 [1, 5]");
+        }
+        List<HoistResult> plainRuns = new ArrayList<>(trials);
+        List<HoistResult> volatileRuns = new ArrayList<>(trials);
+        log.info("【对照实验】开始，settleMillis={}，每组 {} 轮，预计耗时约 {} 秒",
+                settleMillis, trials, Math.round(2 * trials * (settleMillis + 200L) / 1000.0));
+        for (int i = 0; i < trials; i++) {
+            // 固定顺序：普通在前、volatile 在后，每轮都一样，避免顺序本身变成变量
+            plainRuns.add(runHoisting(false, settleMillis));
+            volatileRuns.add(runHoisting(true, settleMillis));
+        }
+        int plainStuck = countStuck(plainRuns);
+        int volatileStuck = countStuck(volatileRuns);
+        log.info("【对照实验】完成，普通字段跑满上限 {}/{} 轮，volatile 跑满上限 {}/{} 轮",
+                plainStuck, trials, volatileStuck, trials);
+        return new CompareResult(settleMillis, trials, plainStuck, volatileStuck,
+                plainRuns, volatileRuns);
+    }
+
+    /**
+     * 数一组结果里有几次是"跑满上限都没看到写入"。
+     *
+     * @param runs 一组实验结果
+     * @return 卡死轮数
+     */
+    private static int countStuck(List<HoistResult> runs) {
+        int stuck = 0;
+        for (HoistResult run : runs) {
+            // sawWrite=false 唯一可能的原因就是读被提出了循环，此时 spins 必然等于上限
+            if (!run.sawWrite()) {
+                stuck++;
+            }
+        }
+        return stuck;
+    }
+
+    /**
+     * 对照组实验结果：两种实现各跑 trials 轮，附带"卡死"次数。
+     *
+     * @param settleMillis 每轮置位前留给 JIT 的时间
+     * @param trials       每组轮数
+     * @param plainStuck   普通字段跑满上限的轮数，越接近 trials 越说明读被提升
+     * @param volatileStuck volatile 字段跑满上限的轮数，正常应恒为 0
+     * @param plainRuns    普通字段每轮的明细
+     * @param volatileRuns volatile 字段每轮的明细
+     */
+    public record CompareResult(long settleMillis,
+                                int trials,
+                                int plainStuck,
+                                int volatileStuck,
+                                List<HoistResult> plainRuns,
+                                List<HoistResult> volatileRuns) {
     }
 
     /**

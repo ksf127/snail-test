@@ -114,6 +114,31 @@ INFO  读线程看到了写入并退出：自旋 451178365 次，耗时 311ms
 
 为什么 `spins` 要设上限：没有上限的话普通字段那次会永远转下去，把 Tomcat 请求线程彻底挂死。加上限后「没看到写入」表现为「跑满上限」，照样能判定，但不会拖垮服务。
 
+#### 正式对比：`/visibility/hoisting/compare`
+
+单跑一次的结果取决于 C2 当时有没有编译完，可能「碰巧通过」。要看规律必须数频次：
+
+```powershell
+curl "http://localhost:8201/phase1/concurrency/visibility/hoisting/compare?settleMillis=2000&trials=3"
+```
+
+同一套循环，普通字段和 volatile 字段各跑 `trials` 轮，**交替执行**（否则先跑的那组会独占 JIT 预热，条件不对等），最后统计各自「跑满上限才退出」的次数：
+
+| 字段 | `settleMillis` | `trials` | 返回字段 | 实测 |
+|---|---|---|---|---|
+| 普通 | 2000 | 3 | `plainStuck` | `3`（接近 `trials`，说明读被提升） |
+| volatile | 2000 | 3 | `volatileStuck` | `0`（恒为 0） |
+
+返回体里 `plainRuns` / `volatileRuns` 是每轮的明细，可以逐轮看 `spins` 和 `sawWrite`。
+
+**耗时**：约 `2 × trials × settleMillis`，默认参数（2000ms × 3 轮 × 2 组）大约 13 秒，不是卡死。
+
+判读：
+
+- `plainStuck == trials` → 每一轮都卡死，读提升已经稳定生效；
+- `plainStuck < trials` → 前几轮还在解释执行，之后 C2 编译完成就再也不看内存了 —— **这正是最危险的地方：本地第一次跑能过，上线跑一会儿就卡死**；
+- `volatileStuck == 0` → volatile 读禁止被提升，任何轮次都能看到写入。
+
 > 工程结论：`useVolatile=false` 在这台机器上「跑得通」不能证明代码是对的。读提升是否发生取决于 C2 的现场决策——解释执行阶段不会提升，编译后就永远不提升了。换 ARM、换 JDK、改一行循环体，问题就可能突然出现。**并发正确性只能靠 JMM 推，不能靠「跑通倒推」**。
 
 ### 2. 五种计数器

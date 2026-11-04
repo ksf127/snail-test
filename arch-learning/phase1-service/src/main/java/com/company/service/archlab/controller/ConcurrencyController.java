@@ -144,6 +144,27 @@ public class ConcurrencyController {
     }
 
     /**
+     * 对照组：同一套循环，普通字段与 volatile 字段各跑 trials 轮，统计各自跑满上限的次数。
+     *
+     * <p>这是"不加 volatile 是不是更容易卡死"的正式答案：单跑一次可能碰巧通过，
+     * 只有数频次才能看出规律。
+     *
+     * <p>耗时约 {@code 2 * trials * settleMillis}，默认参数约 13 秒，属正常。
+     *
+     * @param settleMillis 每轮置位前留给 JIT 的时间
+     * @param trials       每组轮数，取值 [1, 5]
+     * @return 两组的明细与卡死次数
+     */
+    @GetMapping("/visibility/hoisting/compare")
+    public ApiResult<VisibilityDemo.CompareResult> compareVisibilityHoisting(
+            @RequestParam(name = "settleMillis", defaultValue = "2000") long settleMillis,
+            @RequestParam(name = "trials", defaultValue = "3") int trials) {
+        log.info("【并发实验接口】/visibility/hoisting/compare 收到请求，settleMillis={}，trials={}",
+                settleMillis, trials);
+        return run(() -> visibilityDemo.compareHoisting(settleMillis, trials));
+    }
+
+    /**
      * 把实验台内部的参数校验失败翻译成 40001，而不是统一 50000。
      *
      * <p>这里只捕获 IllegalArgumentException：参数错误是可以归因到调用方的，

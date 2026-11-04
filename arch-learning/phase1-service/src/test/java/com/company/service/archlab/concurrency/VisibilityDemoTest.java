@@ -50,4 +50,29 @@ class VisibilityDemoTest {
                 IllegalArgumentException.class, () -> demo.runHoisting(true, 0L));
         assertThat(error.getMessage()).contains("settleMillis");
     }
+
+    @Test
+    void compareShouldReturnBothGroupsAndNeverStuckOnVolatile() {
+        // 用最小参数把耗时压到亚秒级：只为验证结构与 volatile 的确定性，
+        // 频次规律本身要靠真实参数的接口去观察，不适合写成断言（受 JIT 现场决策影响）
+        VisibilityDemo.CompareResult result = demo.compareHoisting(100L, 1);
+
+        assertThat(result.trials()).isEqualTo(1);
+        assertThat(result.plainRuns()).hasSize(1);
+        assertThat(result.volatileRuns()).hasSize(1);
+        // volatile 读禁止被提升，这条断言在任何架构上都成立
+        assertThat(result.volatileStuck()).isZero();
+        assertThat(result.volatileRuns().get(0).sawWrite()).isTrue();
+    }
+
+    @Test
+    void compareShouldRejectTrialsOutOfRange() {
+        IllegalArgumentException tooFew = org.junit.jupiter.api.Assertions.assertThrows(
+                IllegalArgumentException.class, () -> demo.compareHoisting(100L, 0));
+        assertThat(tooFew.getMessage()).contains("trials");
+
+        IllegalArgumentException tooMany = org.junit.jupiter.api.Assertions.assertThrows(
+                IllegalArgumentException.class, () -> demo.compareHoisting(100L, 6));
+        assertThat(tooMany.getMessage()).contains("trials");
+    }
 }
