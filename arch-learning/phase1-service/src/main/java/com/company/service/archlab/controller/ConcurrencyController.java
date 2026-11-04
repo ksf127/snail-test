@@ -7,6 +7,7 @@ import com.company.common.core.ApiResult;
 import com.company.common.core.BizException;
 import com.company.common.core.ErrorCode;
 import com.company.service.archlab.concurrency.CounterComparison;
+import com.company.service.archlab.concurrency.OrderingDemo;
 import com.company.service.archlab.concurrency.VirtualThreadComparison;
 import com.company.service.archlab.concurrency.VisibilityDemo;
 
@@ -29,7 +30,8 @@ import org.springframework.web.bind.annotation.RestController;
  *
  * <p>【怎么读这段代码】按"端点 → Service"逐个看：
  * counter / counterAll → CounterComparison，threads → VirtualThreadComparison，
- * visibility → VisibilityDemo。所有端点共用的异常翻译在最后的 {@link #run(Supplier)}。
+ * visibility 系列 → VisibilityDemo（可见性 + 读提升），ordering 系列 → OrderingDemo（有序性 + 内存屏障）。
+ * 所有端点共用的异常翻译在最后的 {@link #run(Supplier)}。
  */
 @RestController
 @RequestMapping("/concurrency")
@@ -43,12 +45,16 @@ public class ConcurrencyController {
 
     private final VisibilityDemo visibilityDemo;
 
+    private final OrderingDemo orderingDemo;
+
     public ConcurrencyController(CounterComparison counterComparison,
                                  VirtualThreadComparison virtualThreadComparison,
-                                 VisibilityDemo visibilityDemo) {
+                                 VisibilityDemo visibilityDemo,
+                                 OrderingDemo orderingDemo) {
         this.counterComparison = counterComparison;
         this.virtualThreadComparison = virtualThreadComparison;
         this.visibilityDemo = visibilityDemo;
+        this.orderingDemo = orderingDemo;
     }
 
     /**
@@ -149,7 +155,8 @@ public class ConcurrencyController {
      * <p>这是"不加 volatile 是不是更容易卡死"的正式答案：单跑一次可能碰巧通过，
      * 只有数频次才能看出规律。
      *
-     * <p>耗时约 {@code 2 * trials * settleMillis}，默认参数约 13 秒，属正常。
+     * <p>耗时：A组一旦读提升就要跑满上限，最坏约 {@code trials * (2 * settleMillis + 1s)}，
+     * 默认参数（2000ms × 3 轮）大约 15 秒，属正常。
      *
      * @param settleMillis 每轮置位前留给 JIT 的时间
      * @param trials       每组轮数，取值 [1, 5]
@@ -162,6 +169,41 @@ public class ConcurrencyController {
         log.info("【并发实验接口】/visibility/hoisting/compare 收到请求，settleMillis={}，trials={}",
                 settleMillis, trials);
         return run(() -> visibilityDemo.compareHoisting(settleMillis, trials));
+    }
+
+    /**
+     * 有序性实验：两个线程各自「写自己的标志位、读对方的标志位」，
+     * 若两人都读到 false，说明写被重排到了读之后（StoreLoad 重排）。
+     *
+     * <p>{@code useVolatile=true} 时 volatile 写之后有 StoreLoad 屏障，重排次数恒为 0。
+     *
+     * @param useVolatile 是否使用 volatile 字段
+     * @param rounds      对拍轮数，取值 [1000, 2000000]，越大越容易撞上重排窗口
+     * @return 重排次数、总轮数、耗时
+     */
+    @GetMapping("/ordering")
+    public ApiResult<OrderingDemo.OrderingResult> ordering(
+            @RequestParam(name = "useVolatile", defaultValue = "false") boolean useVolatile,
+            @RequestParam(name = "rounds", defaultValue = "200000") int rounds) {
+        log.info("【并发实验接口】/ordering 收到请求，useVolatile={}，rounds={}", useVolatile, rounds);
+        return run(() -> orderingDemo.run(useVolatile, rounds));
+    }
+
+    /**
+     * 有序性对照组：A组普通字段与 B组 volatile 字段交替各跑 trials 轮，统计重排次数。
+     *
+     * <p>耗时约 {@code 2 * trials * rounds} 次对拍，默认参数（20 万 × 3 轮）约 1 秒。
+     *
+     * @param rounds 每组每轮的对拍次数
+     * @param trials 每组轮数，取值 [1, 5]
+     * @return 两组的重排次数与逐轮明细
+     */
+    @GetMapping("/ordering/compare")
+    public ApiResult<OrderingDemo.OrderingCompareResult> compareOrdering(
+            @RequestParam(name = "rounds", defaultValue = "200000") int rounds,
+            @RequestParam(name = "trials", defaultValue = "3") int trials) {
+        log.info("【并发实验接口】/ordering/compare 收到请求，rounds={}，trials={}", rounds, trials);
+        return run(() -> orderingDemo.compare(rounds, trials));
     }
 
     /**

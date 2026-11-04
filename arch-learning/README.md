@@ -43,13 +43,14 @@ mvn -o -pl arch-learning/phase1-service -am spring-boot:run
 | # | 实验 | 类 | 接口 |
 |---|---|---|---|
 | 1 | JMM 可见性 | `concurrency/VisibilityDemo` | `GET /phase1/concurrency/visibility` |
-| 2 | 原子性：五种计数器 | `concurrency/CounterComparison` | `GET /phase1/concurrency/counter`、`/counter/all` |
-| 3 | 自研 CAS 自旋锁 | `concurrency/CasSpinLock` | 单元测试 `CasSpinLockTest` |
-| 4 | 生产者-消费者 | `concurrency/BoundedBuffer` | 单元测试 `BoundedBufferTest` |
-| 5 | 虚拟线程 vs 平台线程 | `concurrency/VirtualThreadComparison` | `GET /phase1/concurrency/threads` |
-| 6 | 策略 + 工厂 | `pattern/pricing/*` | `GET /phase1/patterns/pricing` |
-| 7 | 责任链 | `pattern/validation/*` | `GET /phase1/patterns/validation` |
-| 8 | 状态机 | `pattern/statemachine/*` | `GET /phase1/patterns/state-machine` |
+| 2 | JMM 有序性：内存屏障 | `concurrency/OrderingDemo` | `GET /phase1/concurrency/ordering`、`/ordering/compare` |
+| 3 | 原子性：五种计数器 | `concurrency/CounterComparison` | `GET /phase1/concurrency/counter`、`/counter/all` |
+| 4 | 自研 CAS 自旋锁 | `concurrency/CasSpinLock` | 单元测试 `CasSpinLockTest` |
+| 5 | 生产者-消费者 | `concurrency/BoundedBuffer` | 单元测试 `BoundedBufferTest` |
+| 6 | 虚拟线程 vs 平台线程 | `concurrency/VirtualThreadComparison` | `GET /phase1/concurrency/threads` |
+| 7 | 策略 + 工厂 | `pattern/pricing/*` | `GET /phase1/patterns/pricing` |
+| 8 | 责任链 | `pattern/validation/*` | `GET /phase1/patterns/validation` |
+| 9 | 状态机 | `pattern/statemachine/*` | `GET /phase1/patterns/state-machine` |
 
 先读类上的 Javadoc，里面写了「实验结论」，再跑接口对照数字。
 
@@ -146,7 +147,65 @@ curl "http://localhost:8201/phase1/concurrency/visibility/hoisting/compare?settl
 
 > 工程结论：`useVolatile=false` 在这台机器上「跑得通」不能证明代码是对的。读提升是否发生取决于 C2 的现场决策——解释执行阶段不会提升，编译后就永远不提升了。换 ARM、换 JDK、改一行循环体，问题就可能突然出现。**并发正确性只能靠 JMM 推，不能靠「跑通倒推」**。
 
-### 2. 五种计数器
+### 2. 有序性：volatile 的内存屏障
+
+可见性回答「什么时候能看到」，有序性回答「指令能不能换顺序」。volatile 的第二个语义就是**禁止特定重排序**，靠的是编译器在字节码层面插入的四类内存屏障：
+
+| 屏障 | 插在哪 | 禁止的重排 |
+|---|---|---|
+| StoreStore | volatile **写**之前 | 前面的普通写被挪到 volatile 写之后 |
+| StoreLoad | volatile **写**之后 | volatile 写与后面的读互换（x86 唯一允许的重排，也是最坑的） |
+| LoadLoad | volatile **读**之后 | 后面的普通读被挪到 volatile 读之前 |
+| LoadStore | volatile **读**之后 | 后面的普通写被挪到 volatile 读之前 |
+
+```powershell
+# A组：普通字段 → 大量重排
+curl "http://localhost:8201/phase1/concurrency/ordering?useVolatile=false&rounds=200000"
+# B组：volatile 字段 → 重排恒为 0
+curl "http://localhost:8201/phase1/concurrency/ordering?useVolatile=true&rounds=200000"
+# 正式对照：两组交替各跑 3 轮，直接看汇总
+curl "http://localhost:8201/phase1/concurrency/ordering/compare?rounds=200000&trials=3"
+```
+
+**实验长什么样**（经典 Dekker 对拍，每一轮由 Phaser 卡同一时刻起跑）：
+
+```java
+// 线程 1
+flag1 = true;              // 写
+boolean r1 = flag2;        // 读对方的标志位
+// 线程 2
+flag2 = true;
+boolean r2 = flag1;
+```
+
+程序顺序上「两个写」都在「两个读」之前。如果 `r1 == false && r2 == false`——两人都没看到对方刚写的值——程序顺序不可能产生这个结果，只能是**写被重排到了读之后**（x86 的 store buffer 允许 Store→Load 重排）。
+
+| 组 | 字段 | `rounds` | 实测重排次数 | 占比 |
+|---|---|---|---|---|
+| A组 | 普通（无 volatile） | 200000 | 约 5.7 万 | 25%~35% |
+| B组 | volatile | 200000 | 0 | 0% |
+
+本机实测日志：
+
+```
+WARN 【有序性实验】A组 普通字段(无volatile)｜结果：20000 次对拍里重排 5713 次（28.565%），耗时 58ms → 写没有先落到内存，后面的读先执行了
+INFO 【有序性实验】B组 volatile 字段｜结果：20000 次对拍里重排 0 次，耗时 18ms
+INFO 【有序性对照实验】A组 普通字段(无volatile)：重排 2282 次，占比 22.820%
+INFO 【有序性对照实验】B组 volatile 字段          ：重排 0 次，占比 0.000%
+INFO 【有序性对照实验】判读：A组出现了重排，B组一次都没有 —— 这就是 volatile 写之后的 StoreLoad 屏障在起作用
+```
+
+**耗时**：每轮对拍约 1µs，20 万轮约 0.2 秒；对照接口默认参数（20 万 × 3 轮 × 2 组）约 1 秒。
+
+判读：
+
+- A组重排次数 **> 0** → 普通字段挡不住 StoreLoad 重排。这就是 `if (instance == null)` 双重检查、Dekker 互斥这类代码不加 volatile 会悄悄出错的根因：**它不会每次都错，但每次都可能错**；
+- B组恒为 0 → volatile 写之后的 StoreLoad 屏障强制先刷出去再读；
+- A组偶发 0 是概率问题（窗口没撞上），加大 `rounds` 即可，不代表代码安全。
+
+> 工程结论：volatile = 可见性 + 有序性，**但不保证原子性**。所以它救不了 `count++`，却足以让「一个线程写标记、另一个线程根据标记读数据」这种发布-订阅模型成立 —— 前提是写标记用 volatile，且数据写在标记之前。
+
+### 3. 五种计数器
 
 ```powershell
 curl "http://localhost:8201/phase1/concurrency/counter/all?threads=8&increments=200000"
@@ -156,18 +215,18 @@ curl "http://localhost:8201/phase1/concurrency/counter?strategy=LONG_ADDER&threa
 对照 `PLAIN` / `SYNCHRONIZED` / `ATOMIC_LONG` / `LONG_ADDER` / `SPIN_LOCK` 的正确性与耗时：
 裸 `long` 丢更新 → `synchronized` 正确但有锁竞争 → `CAS` 中等 → `LongAdder` 分段累加在高并发写场景最优（读场景反而是 `AtomicLong` 好）。
 
-### 3. 自研自旋锁 `CasSpinLock`
+### 4. 自研自旋锁 `CasSpinLock`
 
 看 `lock()` 的 `compareAndSet` 循环，以及每 1024 次自旋 `Thread.yield()` 的原因：
 - 纯自旋会持续占 CPU，`yield` 让出时间片让持锁线程更快跑完
 - 它**不可重入**——同一线程二次加锁会死锁，这正是 `ReentrantLock` 要维护 owner + holdCount 的原因
 
-### 4. 生产者-消费者 `BoundedBuffer`
+### 5. 生产者-消费者 `BoundedBuffer`
 
 重点看 `take()` 里为什么是 `while (count == 0)` 而不是 `if`：
 `await()` 被唤醒后必须重新检查条件（可能被其他线程抢走、也可能是伪唤醒），否则会读到空数据。
 
-### 5. 虚拟线程
+### 6. 虚拟线程
 
 ```powershell
 curl "http://localhost:8201/phase1/concurrency/threads?tasks=2000&ioMillis=50&poolSize=200"
@@ -176,7 +235,7 @@ curl "http://localhost:8201/phase1/concurrency/threads?tasks=2000&ioMillis=50&po
 2000 个任务、每个阻塞 50ms：平台线程池 200 个 → 约 `(2000/200)*50 = 500ms`；虚拟线程 → 约 50ms 量级。
 结论：**I/O 密集用虚拟线程，CPU 密集用它没有收益**。
 
-### 6. 设计模式（每组都有"坏味道"对照实现）
+### 7. 设计模式（每组都有"坏味道"对照实现）
 
 ```powershell
 # 策略 + 工厂
