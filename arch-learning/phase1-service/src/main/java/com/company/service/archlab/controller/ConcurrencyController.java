@@ -107,6 +107,9 @@ public class ConcurrencyController {
     /**
      * 可见性实验：{@code useVolatile=false} 时，观察读线程是否能及时看到写线程的更新。
      *
+     * <p>注意这个接口在 x86 上测不出差异（循环体不够干净，C2 不会做读提升），
+     * 数字差异全是调度噪声。想看真实差异请用 {@link #visibilityHoisting(boolean, long)}。
+     *
      * @param useVolatile   是否使用 volatile 字段
      * @param timeoutMillis 读线程最长自旋时间
      * @return 是否观察到新值及自旋次数
@@ -118,6 +121,26 @@ public class ConcurrencyController {
         log.info("【并发实验接口】/visibility 收到请求，useVolatile={}，timeoutMillis={}",
                 useVolatile, timeoutMillis);
         return run(() -> visibilityDemo.run(useVolatile, timeoutMillis));
+    }
+
+    /**
+     * 读提升实验：把循环体压到只剩一次字段读，让 JIT 有机会把读提到循环外。
+     *
+     * <p>这是能真正看出 volatile 差别的接口：
+     * {@code useVolatile=false} 时读线程会一路自旋到上限（写入永远看不到），
+     * {@code useVolatile=true} 时主线程一置位它立刻退出。
+     *
+     * @param useVolatile  是否使用 volatile 字段
+     * @param settleMillis 置位前留给 JIT 编译的时间，越短越容易还没编译就置位
+     * @return 自旋次数、是否看到写入、耗时
+     */
+    @GetMapping("/visibility/hoisting")
+    public ApiResult<VisibilityDemo.HoistResult> visibilityHoisting(
+            @RequestParam(name = "useVolatile", defaultValue = "false") boolean useVolatile,
+            @RequestParam(name = "settleMillis", defaultValue = "500") long settleMillis) {
+        log.info("【并发实验接口】/visibility/hoisting 收到请求，useVolatile={}，settleMillis={}",
+                useVolatile, settleMillis);
+        return run(() -> visibilityDemo.runHoisting(useVolatile, settleMillis));
     }
 
     /**

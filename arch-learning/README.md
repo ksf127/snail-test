@@ -76,10 +76,45 @@ curl "http://localhost:8201/phase1/concurrency/visibility?useVolatile=true&timeo
 本地跑 `useVolatile=false` 大概率也是几微秒就看到了，这是正常的：
 
 - x86-64 是 TSO 模型，普通写也会很快传播到其他核心，比 JMM 的要求严格得多；
-- 本实验的循环体里有 `System.nanoTime()` 和接口调用 `flag.get()`，JIT（C2）无法证明读是循环不变量，所以没把读提升出循环；
-- 真正出事的前提是"干净循环 + C2 提升读操作"，那时才会死循环，而且死循环在这台机器上也测不出来（会一直卡住）。
+- 本实验的循环体里有 `System.nanoTime()` 和接口调用 `flag.get()`，JIT（C2）无法证明读是循环不变量，所以没把读提升出循环。
 
-所以：**`useVolatile=false` 在这台机器上跑得通，不能证明代码是对的**。换 ARM、换 JDK、改一行循环体，问题就可能冒出来。并发正确性只能靠 JMM 推，不能靠"跑通倒推"。
+**所以这个接口在 x86 上测出来的数字差异全是调度噪声**（甚至会出现 volatile 那次更慢的倒挂）。重复跑它只会得到随机数，看不出任何规律。
+
+#### 真正能看出差别的接口：`/visibility/hoisting`
+
+```powershell
+# 普通字段：读线程一路自旋到 20 亿次上限，写入从未可见
+curl "http://localhost:8201/phase1/concurrency/visibility/hoisting?useVolatile=false&settleMillis=500"
+# volatile：主线程一置位它立刻退出
+curl "http://localhost:8201/phase1/concurrency/visibility/hoisting?useVolatile=true&settleMillis=500"
+```
+
+区别只在于**循环体够不够干净**。这个实验把循环压到只剩一次字段读：
+
+```java
+long spins = 0L;
+while (!holder.stop && spins < LIMIT) { spins++; }
+```
+
+条件里只有一次字段读、循环体只有一次自增，C2 能证明「循环期间没人写这个字段」，于是把读挪到循环外只做一次，循环退化成 `while (spins < LIMIT)` —— 这就是 **loop-invariant code motion（读提升）**。
+
+| 参数 | 返回 `sawWrite` | `spins` | 含义 |
+|---|---|---|---|
+| `useVolatile=false` | `false` | 等于 `spinLimit`（20 亿） | 读被提出循环，写入永远看不到 |
+| `useVolatile=true` | `true` | 远小于上限（实测约 4.5 亿） | volatile 读禁止提升，立刻看到 |
+
+本机实测日志：
+
+```
+WARN  读线程跑满 2000000000 次上限才退出：写入从未对它可见
+INFO  读线程看到了写入并退出：自旋 451178365 次，耗时 311ms
+```
+
+这就是**两个数量级、且方向确定**的差异 —— 一眼能分辨，不是噪声。
+
+为什么 `spins` 要设上限：没有上限的话普通字段那次会永远转下去，把 Tomcat 请求线程彻底挂死。加上限后「没看到写入」表现为「跑满上限」，照样能判定，但不会拖垮服务。
+
+> 工程结论：`useVolatile=false` 在这台机器上「跑得通」不能证明代码是对的。读提升是否发生取决于 C2 的现场决策——解释执行阶段不会提升，编译后就永远不提升了。换 ARM、换 JDK、改一行循环体，问题就可能突然出现。**并发正确性只能靠 JMM 推，不能靠「跑通倒推」**。
 
 ### 2. 五种计数器
 

@@ -128,6 +128,188 @@ public class VisibilityDemo {
         return new Result(useVolatile, true, elapsedMillis, polls, latencyMicros);
     }
 
+    // ------------------------------------------------------------------
+    // 上面那个 run() 在 x86 上测不出差异，因为循环体不够"干净"。
+    // 下面这个才是能真正看到差别的实验：把循环体压到只剩一次字段读，
+    // 让 C2 有机会把这次读提出循环 —— 那时普通字段就再也看不到新值了。
+    // ------------------------------------------------------------------
+
+    /**
+     * 自旋上限，防止实验把 CPU 烧穿。
+     *
+     * <p>2e9 次自增大约 0.8 秒 CPU 时间。之所以要这么大，是因为必须让循环"热"到
+     * C2（服务端编译器）完成编译并做出优化，否则测的只是解释执行的结果。
+     */
+    private static final long HOIST_SPIN_LIMIT = 2_000_000_000L;
+
+    /**
+     * 等待读线程退出的宽限时间。
+     */
+    private static final long HOIST_JOIN_MILLIS = 5_000L;
+
+    /**
+     * 【核心实验】把"读标记位"放进一个足够干净的循环，看 JIT 会不会把读提升出循环。
+     *
+     * <p>【为什么要另做一个实验】{@link #run(boolean, long)} 的循环体里有接口调用
+     * （{@code flag.get()} 是多态分派）和 {@code System.nanoTime()}，C2 无法证明
+     * "字段在循环期间不变"，所以不敢把读提到循环外，两种实现的表现就完全一样，
+     * 只能测到调度噪声。
+     *
+     * <p>【这个实验的循环长什么样】
+     * <pre>
+     *   long n = 0;
+     *   while (!holder.stop &amp;&amp; n &lt; LIMIT) { n++; }
+     * </pre>
+     * 循环体只有一次自增，条件里只有一次字段读 —— 这是 C2 最容易做"读提升"（loop-invariant
+     * code motion）的形态：既然循环里没人写这个字段，就把读挪到循环外只做一次，
+     * 循环于是退化成 {@code while (n < LIMIT)}。
+     *
+     * <p>【预期结果，两种实现天差地别】
+     * <ul>
+     *   <li>{@code useVolatile=true}：volatile 读不允许被提升（JMM 要求每次都重新读），
+     *       所以主线程一置位，读线程很快就退出，{@code spins} 远小于上限；</li>
+     *   <li>{@code useVolatile=false}：读被提出循环，主线程置位对读线程等于不存在，
+     *       它会一路自旋到上限才退出，{@code sawWrite=false}。</li>
+     * </ul>
+     *
+     * <p>【为什么循环要有 {@code n < LIMIT}】没有上限的话，普通字段那次会永远转下去，
+     * Tomcat 的请求线程就再也回不来了。加上上限后，"没看到写入"表现为
+     * "跑满上限"，同样能判定，但不会把服务拖死。
+     *
+     * @param useVolatile  true 用 volatile 字段，false 用普通字段
+     * @param settleMillis 启动读线程后先等多久再置位，留给 JIT 编译；取值 [1, 5000]
+     * @return 自旋次数、是否看到了写入、耗时
+     * @throws IllegalArgumentException settleMillis 越界
+     * @throws IllegalStateException    等待过程中被中断
+     */
+    public HoistResult runHoisting(boolean useVolatile, long settleMillis) {
+        if (settleMillis < 1L || settleMillis > 5_000L) {
+            throw new IllegalArgumentException("settleMillis 必须落在 [1, 5000]");
+        }
+        // 每次调用都新建 holder：两个请求同时跑不会互相看到对方的标记位。
+        // 注意必须用两个不同的类，而不是一个带泛型的类 —— 字段的 volatile 修饰
+        // 是编译期属性，只有两个独立的 final 类才能让 C2 看到两种不同的内存语义。
+        PlainStop plain = new PlainStop();
+        VolatileStop vol = new VolatileStop();
+        // 读线程退出时把自己的自旋次数放进来；-1 表示"还没出来"
+        AtomicLong spins = new AtomicLong(-1L);
+
+        Thread reader = new Thread(() -> {
+            long n = useVolatile
+                    ? spinOnVolatile(vol)
+                    : spinOnPlain(plain);
+            spins.set(n);
+        }, "hoist-reader");
+        reader.setDaemon(true);
+        reader.start();
+
+        long begin = System.nanoTime();
+        try {
+            // 必须等一会儿再置位：C2 是后台编译的，刚启动时读线程还在解释执行，
+            // 那时无论用不用 volatile 都会立刻看到新值，测不出任何东西
+            TimeUnit.MILLISECONDS.sleep(settleMillis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("等待 JIT 编译时被中断", e);
+        }
+
+        log.info("【读提升实验】开始置位，useVolatile={}，已让读线程空转 {}ms", useVolatile, settleMillis);
+        // 这里是唯一的变量：写同一个语义的标记位，只是字段一个是 volatile 一个不是
+        if (useVolatile) {
+            vol.stop = true;
+        } else {
+            plain.stop = true;
+        }
+
+        try {
+            reader.join(HOIST_JOIN_MILLIS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("等待读线程退出时被中断", e);
+        }
+
+        long elapsedMillis = Math.max(1L, (System.nanoTime() - begin) / 1_000_000L);
+        long actualSpins = spins.get();
+        boolean sawWrite = actualSpins >= 0L && actualSpins < HOIST_SPIN_LIMIT;
+        if (sawWrite) {
+            log.info("【读提升实验】读线程看到了写入并退出：自旋 {} 次，耗时 {}ms。"
+                            + "这就是 volatile 承诺的可见性", actualSpins, elapsedMillis);
+        } else {
+            log.warn("【读提升实验】读线程跑满 {} 次上限才退出：写入从未对它可见。"
+                            + "原因是循环里那次字段读被 C2 提出了循环，循环体里再也不存在读内存这个动作",
+                    HOIST_SPIN_LIMIT);
+        }
+        return new HoistResult(useVolatile, sawWrite, actualSpins, HOIST_SPIN_LIMIT,
+                settleMillis, elapsedMillis);
+    }
+
+    /**
+     * 干净自旋：条件里直接读普通字段，循环体只有自增。
+     *
+     * <p>单独写成方法而不是内联，是为了让 C2 在这里能看到一个单态的、无副作用的循环，
+     * 从而真的去做读提升。别把它改成"调用 {@link PlainStop#get()}"——
+     * 多一层方法调用，C2 就更可能放弃提升，实验立刻失去意义。
+     *
+     * @return 退出时累计的自旋次数
+     */
+    private static long spinOnPlain(PlainStop holder) {
+        long spins = 0L;
+        while (!holder.stop && spins < HOIST_SPIN_LIMIT) {
+            spins++;
+        }
+        return spins;
+    }
+
+    /**
+     * 干净自旋：与 {@link #spinOnPlain(PlainStop)} 逐字对应，只差字段的 volatile。
+     *
+     * <p>volatile 读自带"每次都必须从内存/缓存一致性协议拿最新值"的语义，
+     * C2 不允许把它提出循环，所以这个循环一定能看到其他线程的写入。
+     *
+     * @return 退出时累计的自旋次数
+     */
+    private static long spinOnVolatile(VolatileStop holder) {
+        long spins = 0L;
+        while (!holder.stop && spins < HOIST_SPIN_LIMIT) {
+            spins++;
+        }
+        return spins;
+    }
+
+    /**
+     * 对照组容器：标记位是普通字段，读线程可能永远看不到主线程的写入。
+     */
+    private static final class PlainStop {
+
+        private boolean stop;
+    }
+
+    /**
+     * 实验组容器：标记位是 volatile 字段，写入对读线程立即可见。
+     */
+    private static final class VolatileStop {
+
+        private volatile boolean stop;
+    }
+
+    /**
+     * 读提升实验的结果。
+     *
+     * @param useVolatile  本次是否用了 volatile
+     * @param sawWrite     读线程是否在上限之前看到了写入；false 说明读被提出了循环
+     * @param spins        读线程实际自旋了多少次
+     * @param spinLimit    上限值，{@code spins} 等于它就是"跑满了没看到"
+     * @param settleMillis 置位前留给 JIT 的时间
+     * @param elapsedMillis 从启动读线程到它退出（或被判定跑满）的耗时
+     */
+    public record HoistResult(boolean useVolatile,
+                              boolean sawWrite,
+                              long spins,
+                              long spinLimit,
+                              long settleMillis,
+                              long elapsedMillis) {
+    }
+
     /**
      * 把"读/写一个标记位"抽象出来，是为了让两种实现可以无差别替换。
      * 没有这个接口，就没法做"只改一个关键字"的对照实验。
