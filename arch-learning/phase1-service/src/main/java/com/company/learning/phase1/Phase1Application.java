@@ -18,5 +18,6 @@ public class Phase1Application {
 
     public static void main(String[] args) {
         SpringApplication.run(Phase1Application.class, args);
+        System.out.println(" 打印标记：Phase1Application微服务起来了！！！");
     }
 }

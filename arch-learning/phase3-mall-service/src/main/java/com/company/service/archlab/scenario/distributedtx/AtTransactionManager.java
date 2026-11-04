@@ -13,6 +13,21 @@ import org.slf4j.LoggerFactory;
 /**
  * Seata AT 的最小可运行复刻：<b>全局行锁 + undo log + 两阶段提交/回滚</b>。
  *
+ * <p>【解决什么问题】跨库的业务写没法用单个本地事务兜住。AT 的思路是"先照常提交，
+ * 出问题再按镜像撤回"：每个分支在本地事务里直接把数据改掉，同时把改之前的旧值
+ * （前镜像）写进 undo log；全局事务失败时，用前镜像把每一步改回去。
+ *
+ * <p>【为什么这样设计】一阶段就提交，意味着必须解决"别人改了我这一行怎么办"，
+ * 于是引入<b>全局行锁</b>：写之前先按 {@code resource:主键} 抢占，持锁到二阶段结束，
+ * 保证回滚时数据还是自己写进去的样子。代价是锁的持有时间长、并发度低，
+ * 换来的是业务代码零侵入 —— 这正是 AT 和 TCC 最大的差别。
+ *
+ * <p>【怎么读这段代码】调用顺序固定为
+ * {@link #begin} → 若干次 {@link #branch} → {@link #commit} 或 {@link #rollback}。
+ * 状态只会按 {@code OPEN → COMMITTED} 或 {@code OPEN → ROLLED_BACK} 迁移，
+ * 重复结束同一个事务会直接抛异常（{@link #requireOpen}）。
+ * {@link #run} 是把这套顺序包装成一次完整实验的便捷入口。
+ *
  * <p>它不是 Seata 的替代品，而是把 AT 的三条核心机制摊开，方便和 TCC / Saga 对照：
  * <ol>
  *   <li><b>一阶段</b>：业务 SQL 直接执行并提交本地事务，同时把"前镜像/后镜像"写进 undo log。
@@ -90,10 +105,24 @@ public class AtTransactionManager {
 
     private final LongAdder undoLogsApplied = new LongAdder();
 
+    /**
+     * 预置一行初始数据，相当于建库时插好的种子数据。
+     *
+     * @param resource 资源名（模拟库名）
+     * @param key      主键
+     * @param value    初始值
+     */
     public void seed(String resource, long key, long value) {
         rows.put(rowId(resource, key), value);
     }
 
+    /**
+     * 读当前值，不存在时返回 0。
+     *
+     * @param resource 资源名
+     * @param key      主键
+     * @return 当前值
+     */
     public long valueOf(String resource, long key) {
         return rows.getOrDefault(rowId(resource, key), 0L);
     }
@@ -101,53 +130,96 @@ public class AtTransactionManager {
     /**
      * 绕过 Seata 代理的本地写入。真实场景里它可能是"没接 Seata 的另一个服务"，
      * 正是脏写与"回滚覆盖别人修改"的来源，这里用它来演示后镜像校验。
+     *
+     * @param resource 资源名
+     * @param key      主键
+     * @param value    要写入的值
      */
     public void localWrite(String resource, long key, long value) {
         rows.put(rowId(resource, key), value);
     }
 
+    /**
+     * 开启一个全局事务，返回带唯一 xid 的上下文。
+     *
+     * <p>幂等性：不幂等，每次调用都会生成新的 xid 并自增序列。
+     *
+     * @param businessId 业务标识，只用于拼出可读的 xid
+     * @return 新的全局事务上下文，状态为 {@code OPEN}
+     */
     public GlobalTransaction begin(String businessId) {
-        return new GlobalTransaction("AT:" + businessId + ":" + xidSequence.incrementAndGet());
+        GlobalTransaction tx = new GlobalTransaction("AT:" + businessId + ":" + xidSequence.incrementAndGet());
+        log.info("【AT】开启全局事务: xid={}", tx.xid());
+        return tx;
     }
 
     /**
      * 一阶段：抢全局锁 → 执行业务写 → 记录 undo log。
      *
      * <p>锁放在写之前，是为了让"后镜像"在被写坏之前就挡住并发的全局事务。
+     *
+     * <p>幂等性：不幂等。重复调用会重复叠加 delta 并多记一条 undo log，
+     * 调用方必须保证同一分支只执行一次。
+     *
+     * @param tx     全局事务上下文，必须处于 {@code OPEN}
+     * @param branch 一个分支：对哪个资源的哪一行做多少增减
+     * @throws AtLockConflictException 该行已被其他全局事务锁定
+     * @throws IllegalStateException   全局事务已结束
      */
     public void branch(GlobalTransaction tx, AtBranch branch) {
         requireOpen(tx);
         String rowId = rowId(branch.resource(), branch.key());
+        // putIfAbsent 就是"抢锁"：抢不到说明别的全局事务正在改这一行
         String owner = globalLocks.putIfAbsent(rowId, tx.xid());
         if (owner != null && !owner.equals(tx.xid())) {
             lockConflicts.increment();
+            log.warn("【AT】全局锁冲突: xid={}, row={}, 持有者={}", tx.xid(), rowId, owner);
             throw new AtLockConflictException("行 " + rowId + " 已被全局事务 " + owner + " 锁定");
         }
         tx.lockedRows.add(rowId);
 
+        // 前镜像 = 改之前的值，回滚时靠它还原；后镜像用于回滚前校验有没有被脏写
         long before = rows.getOrDefault(rowId, 0L);
         long after = before + branch.delta();
         rows.put(rowId, after);
         tx.undoLogs.add(new UndoLog(tx.xid(), branch.resource(), branch.key(), before, after));
         undoLogsWritten.increment();
+        log.info("【AT】一阶段分支完成: xid={}, row={}, before={}, after={}",
+                tx.xid(), rowId, before, after);
     }
 
     /**
      * 二阶段全局提交：本地数据在一阶段已经落地，这里只清 undo log 并释放全局锁。
+     *
+     * <p>幂等性：不幂等，事务已结束后再调用会抛异常。
+     *
+     * @param tx 全局事务上下文
+     * @throws IllegalStateException 全局事务已结束
      */
     public void commit(GlobalTransaction tx) {
         requireOpen(tx);
+        // 提交不需要还原数据，只要把 undo log 丢掉并放锁 —— 所以 AT 的提交非常快
+        int lockCount = tx.lockedRows.size();
         tx.undoLogs.clear();
         releaseLocks(tx);
         tx.status = Status.COMMITTED;
         commits.increment();
+        log.info("【AT】二阶段全局提交: xid={}, 释放 {} 把全局锁", tx.xid(), lockCount);
     }
 
     /**
      * 二阶段全局回滚：按 undo log 逆序还原；还原前校验后镜像，不等则计脏写。
+     *
+     * <p>幂等性：不幂等，事务已结束后再调用会抛异常。
+     *
+     * @param tx 全局事务上下文
+     * @throws IllegalStateException 全局事务已结束
      */
     public void rollback(GlobalTransaction tx) {
         requireOpen(tx);
+        // 先记下条数：下面清空 undoLogs 后就取不到了
+        int restoreCount = tx.undoLogs.size();
+        // 逆序还原：后执行的分支先撤，避免中间状态被前面的 undo 覆盖
         for (int i = tx.undoLogs.size() - 1; i >= 0; i--) {
             UndoLog undo = tx.undoLogs.get(i);
             String rowId = rowId(undo.resource(), undo.key());
@@ -164,12 +236,20 @@ public class AtTransactionManager {
         releaseLocks(tx);
         tx.status = Status.ROLLED_BACK;
         rollbacks.increment();
+        log.info("【AT】二阶段全局回滚: xid={}, 还原 {} 个分支, 脏写 {} 次",
+                tx.xid(), restoreCount, dirtyWrites.sum());
     }
 
     /**
      * 协调器视角的一次完整全局事务：任一分支出错就走全局回滚。
      *
-     * @param failAt 第几个分支失败（0 基），-1 表示全部成功
+     * <p>幂等性：不幂等，每次调用都是一个新的全局事务。
+     *
+     * @param businessId 业务标识
+     * @param branches   按顺序执行的分支列表
+     * @param failAt     第几个分支失败（0 基），-1 表示全部成功
+     * @return 本次全局事务的结果统计
+     * @throws IllegalArgumentException failAt 越界
      */
     public AtRun run(String businessId, List<AtBranch> branches, int failAt) {
         if (failAt < -1 || failAt >= branches.size()) {
@@ -194,12 +274,20 @@ public class AtTransactionManager {
             commit(tx);
             return report(true, executed, writtenBefore, appliedBefore, conflictsBefore, dirtyBefore, start, null);
         } catch (RuntimeException e) {
+            // 任一分支出错都走全局回滚：这是"一起成功或一起失败"的唯一入口
+            log.warn("【AT】分支失败，触发全局回滚: xid={}, 已执行 {} 个分支, error={}",
+                    tx.xid(), executed, e.getMessage());
             rollback(tx);
             return report(false, executed, writtenBefore, appliedBefore, conflictsBefore, dirtyBefore, start,
                     e.getMessage());
         }
     }
 
+    /**
+     * 累计统计快照，供实验接口观测锁冲突、脏写、undo log 数量。
+     *
+     * @return 当前累计值，扫描时不加锁，只用于展示
+     */
     public AtStats stats() {
         return new AtStats(commits.sum(), rollbacks.sum(), lockConflicts.sum(), dirtyWrites.sum(),
                 undoLogsWritten.sum(), undoLogsApplied.sum(), globalLocks.size());
@@ -234,7 +322,12 @@ public class AtTransactionManager {
         return resource + ":" + key;
     }
 
-    /** 一个全局事务的本地上下文：undo log 与持有的全局锁。 */
+    /**
+     * 一个全局事务的本地上下文：undo log 与持有的全局锁。
+     *
+     * <p>真实 Seata 里这些信息保存在 TC 服务端（xid 对应的 branch 表），
+     * 这里放在对象里只是为了单机演示，所以即使进程崩溃也无法恢复。
+     */
     public static final class GlobalTransaction {
 
         private final String xid;

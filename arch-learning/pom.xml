@@ -27,6 +27,12 @@
     <packaging>pom</packaging>
     <name>arch-learning</name>
 
+    <properties>
+        <!-- knife4j 4.5.0 绑定的 springdoc 版本，两者必须一致 -->
+        <springdoc.version>2.3.0</springdoc.version>
+        <knife4j.version>4.5.0</knife4j.version>
+    </properties>
+
     <modules>
         <module>phase1-service</module>
         <module>phase2-service</module>
@@ -61,6 +67,21 @@
             <groupId>io.micrometer</groupId>
             <artifactId>micrometer-registry-prometheus</artifactId>
             <scope>runtime</scope>
+        </dependency>
+
+        <!--
+          Knife4j UI：启动后访问 http://localhost:<端口>/<上下文>/doc.html
+          中文界面，左侧树形菜单，参数带默认值，可直接在页面上发请求调试。
+        -->
+        <dependency>
+            <groupId>com.github.xiaoymin</groupId>
+            <artifactId>knife4j-openapi3-jakarta-spring-boot-starter</artifactId>
+            <version>${knife4j.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.springdoc</groupId>
+            <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+            <version>${springdoc.version}</version>
         </dependency>
 
         <dependency>

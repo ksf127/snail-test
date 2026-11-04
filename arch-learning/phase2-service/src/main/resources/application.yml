@@ -22,3 +22,9 @@ arch-lab:
     # memory：用本地 Map 模拟 L2，开箱即用
     # redis：改用 StringRedisTemplate，需要本地 Redis 可用
     remote: memory
+
+# 接口调试：http://localhost:8202/phase2/doc.html
+knife4j:
+  enable: true
+  setting:
+    language: zh_cn

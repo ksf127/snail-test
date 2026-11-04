@@ -3,18 +3,23 @@ package com.company.service.archlab.scenario.consistency;
 import java.util.ArrayList;
 import java.util.List;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 /**
  * 缓存与数据库一致性实验：同一个"读缓存→回源→回填"的读路径，
  * 配上四种写路径，看哪种写法会留下长期脏数据。
  *
- * <p>这里用<b>受控时序</b>复现竞态窗口，而不是靠多线程抢跑：
+ * <p>【解决什么问题】缓存和数据库是两个独立的存储，一次写操作无法原子地同时更新两者。
+ * 只要读请求的"回源 + 回填"和写请求的"更库 + 删缓存"发生交错，缓存里就可能留下永远不消失的旧值。
+ * 用户看到的是旧价格、旧库存，而且刷新多少次都没用——因为缓存里的脏数据没人会再删它。
+ *
+ * <p>【为什么这样设计】这里用<b>受控时序</b>复现竞态窗口，而不是靠多线程抢跑：
  * 线程调度不确定，跑一百次可能一次都复现不出来，结论就变成了"我本地没问题"。
  * 真实系统的窗口大小取决于"回源耗时 + 回填耗时"与"更库 + 删缓存耗时"的差值，
  * 所以用显式步骤把最坏时序固定下来，每一次都能稳定复现。
- *
- * <p>四个策略的结论（{@link #run} 的返回值可验证）：
+ * 四种策略不是"实现不同"，而是"删除缓存相对于更库和回填的位置"不同：
  * <ul>
  *   <li>先更库后删缓存：回填发生在删缓存之后，回填时数据库已是新值 → 缓存永久停留在旧值；</li>
  *   <li>先删缓存后更库：删缓存后、更库前有读请求回源，回填旧值，此后再也没人删它 → 缓存永久停留在旧值。
@@ -24,7 +29,9 @@ import org.springframework.stereotype.Service;
  *   <li>读写共用 key 锁：回填与"更库+删缓存"互斥，不会出现"已提交之后又回填旧值" → 既没有脏回填，也没有脏读。</li>
  * </ul>
  *
- * <p>两个指标要分开看：
+ * <p>【怎么读这段代码】先看 {@link Strategy} 的四个枚举，它们就是四种写路径；
+ * 再按 {@link #execute} 里每个 case 的步骤顺序读，每一步都会往 timeline 里追加一条记录；
+ * 最后看 {@link #run} 如何统计两种指标：
  * <ul>
  *   <li>{@code staleFills}：回填时数据库已经是新值（回填即过期）的轮数——先更库后删缓存才会命中；</li>
  *   <li>{@code dirtyRounds}：一轮结束后缓存与数据库仍不一致的轮数——这是用户真正能感知到的脏数据。</li>
@@ -35,6 +42,8 @@ import org.springframework.stereotype.Service;
  */
 @Service
 public class ConsistencyLab {
+
+    private static final Logger log = LoggerFactory.getLogger(ConsistencyLab.class);
 
     private static final String OLD_VALUE = "v1";
 
@@ -65,6 +74,7 @@ public class ConsistencyLab {
         }
     }
 
+    /** 时序记录中的一步；cache/db 是执行完这一步之后的状态快照。 */
     public record Step(int seq, String actor, String action, String cache, String db) {
     }
 
@@ -89,7 +99,12 @@ public class ConsistencyLab {
     }
 
     /**
-     * @param rounds 重复轮数：一轮脏不算问题，每一轮都脏才是设计缺陷
+     * 连续跑多轮实验并汇总结果。
+     *
+     * @param strategy 写路径策略，不能为空
+     * @param rounds   重复轮数：一轮脏不算问题，每一轮都脏才是设计缺陷
+     * @return 脏轮数、脏回填轮数以及最后一轮的完整时序
+     * @throws IllegalArgumentException strategy 为空或 rounds 不在 [1, 1000] 时抛出
      */
     public Result run(Strategy strategy, int rounds) {
         if (strategy == null) {
@@ -99,6 +114,8 @@ public class ConsistencyLab {
             throw new IllegalArgumentException("rounds 必须在 [1, 1000] 之间");
         }
 
+        log.info("【缓存一致性实验】开始，strategy={}（{}），rounds={}",
+                strategy, strategy.label(), rounds);
         int dirtyRounds = 0;
         int staleFills = 0;
         Round last = null;
@@ -108,13 +125,14 @@ public class ConsistencyLab {
             if (round.staleFill) {
                 staleFills++;
             }
+            // 用最终读到的值与数据库比较：只要不一致，用户就会看到脏数据。
             if (!round.observed().equals(round.db)) {
                 dirtyRounds++;
             }
             last = round;
         }
 
-        return new Result(strategy.name(),
+        Result result = new Result(strategy.name(),
                 strategy.label(),
                 rounds,
                 dirtyRounds,
@@ -122,11 +140,26 @@ public class ConsistencyLab {
                 last.observed(),
                 last.db,
                 List.copyOf(last.steps));
+        log.info("【缓存一致性实验】结束，strategy={}，脏轮数={}/{}，脏回填轮数={}，" +
+                        "最终缓存值={}，数据库值={}",
+                strategy, dirtyRounds, rounds, staleFills, result.finalValue(), result.dbValue());
+        if (result.dirty()) {
+            log.warn("【缓存一致性实验】策略 {} 会在最后留下缓存脏数据，详见 timeline",
+                    strategy);
+        }
+        return result;
     }
 
+    /**
+     * 按策略执行一轮受控时序。
+     *
+     * <p>所有步骤都在单线程里按固定顺序执行，顺序本身就是我们要复现的"最坏交错"。
+     */
     private void execute(Strategy strategy, Round round) {
         switch (strategy) {
             case UPDATE_DB_THEN_DELETE_CACHE -> {
+                // reader 先读到旧值（此时还没回填），writer 完成"更库 + 删缓存"之后 reader 才回填，
+                // 于是旧值绕过删除动作重新写进缓存，且之后再也没人删它。
                 round.miss();
                 String read = round.readDb();
                 round.writeDb("writer 更新数据库");
@@ -134,6 +167,8 @@ public class ConsistencyLab {
                 round.fillCache(read, "reader 回填缓存（旧值）");
             }
             case DELETE_CACHE_THEN_UPDATE_DB -> {
+                // 删除发生在更库之前：reader 在"删除后、更库前"回源，读到旧值并回填，
+                // 这次回填发生在删除之后，所以删除没能清掉它；更库也不再碰缓存。
                 round.deleteCache("writer 删除缓存");
                 round.miss();
                 String read = round.readDb();
@@ -141,6 +176,8 @@ public class ConsistencyLab {
                 round.writeDb("writer 更新数据库");
             }
             case DELAYED_DOUBLE_DELETE -> {
+                // 第一次删除只是为了尽早清掉旧缓存；关键是更库之后的第二次删除，
+                // 它负责把"删除与更库之间回填进去的旧值"再清一次。
                 round.deleteCache("writer 删除缓存（第一次）");
                 round.miss();
                 String read = round.readDb();
@@ -149,6 +186,8 @@ public class ConsistencyLab {
                 round.deleteCache("writer 延迟删除缓存（第二次）");
             }
             case LOCK_PROTECTED -> {
+                // 读写共用同一把 key 锁：reader 的回源+回填整体与 writer 的更库+删缓存互斥，
+                // 不会出现"更库已经提交，reader 却拿着旧值回填"的时序。
                 round.lock("reader 获取 key 锁");
                 round.miss();
                 String read = round.readDb();
@@ -186,6 +225,7 @@ public class ConsistencyLab {
         }
 
         private void fillCache(String value, String action) {
+            // 回填那一刻数据库已经不是这个值，说明这次回填写进去的就是过期数据。
             if (!value.equals(db)) {
                 staleFill = true;
             }
@@ -211,6 +251,7 @@ public class ConsistencyLab {
             record("lock", action);
         }
 
+        /** 下一次读请求实际会拿到的值：缓存有就用缓存，否则回源数据库。 */
         private String observed() {
             return cache != null ? cache : db;
         }

@@ -59,3 +59,9 @@ shortlink:
     store: memory
     hash-key: "shortlink:clicks"
     flush-interval-millis: 1000
+
+# 接口调试：http://localhost:8203/shortlink/doc.html
+knife4j:
+  enable: true
+  setting:
+    language: zh_cn
