@@ -137,17 +137,33 @@ public class VisibilityDemo {
     // ------------------------------------------------------------------
 
     /**
-     * 自旋上限，防止实验把 CPU 烧穿。
+     * 自旋上限的下限，防止校准拿到异常值时上限小到实验还没开始就结束。
      *
-     * <p>2e9 次自增大约 0.8 秒 CPU 时间。之所以要这么大，是因为必须让循环"热"到
-     * C2（服务端编译器）完成编译并做出优化，否则测的只是解释执行的结果。
+     * <p>注意上限本身不是常量：写死过一次 20 亿，结果本机自旋速度约 15 亿次/秒，
+     * 读线程 1.3 秒就跑满退出了，比 settleMillis 还短 —— 置位发生在它结束之后，
+     * 两组都报"没看到写入"，实验直接失效。现在改成按本机实测速度动态推算。
      */
-    private static final long HOIST_SPIN_LIMIT = 2_000_000_000L;
+    private static final long HOIST_MIN_SPIN_LIMIT = 100_000_000L;
 
     /**
-     * 等待读线程退出的宽限时间。
+     * 置位之后额外留给读线程的余量：上限必须在置位之后才到达，否则读线程会先跑满退出。
      */
-    private static final long HOIST_JOIN_MILLIS = 5_000L;
+    private static final long HOIST_EXTRA_MILLIS = 1_000L;
+
+    /**
+     * 校准采样：让探针空转这么多次，用耗时反推本机每秒能自旋多少次。
+     *
+     * <p>必须用"跑固定次数、除以耗时"的方式，而不是"跑固定时长、数次数"。
+     * 后者只能写成 {@code while (System.nanoTime() - begin < 20ms)}，循环体里每轮都要
+     * 调一次 {@code nanoTime}（约 20ns），比纯自旋慢几十倍，折算出的上限会小到在置位
+     * 之前就到达 —— 上一版实验正是这样失效的。
+     */
+    private static final long CALIBRATION_SPINS = 50_000_000L;
+
+    /**
+     * 等待读线程退出时，在上限对应的时长之外多给的宽限时间。
+     */
+    private static final long HOIST_JOIN_BUFFER_MILLIS = 3_000L;
 
     /**
      * 【核心实验】把"读标记位"放进一个足够干净的循环，看 JIT 会不会把读提升出循环。
@@ -185,9 +201,23 @@ public class VisibilityDemo {
      * @throws IllegalStateException    等待过程中被中断
      */
     public HoistResult runHoisting(boolean useVolatile, long settleMillis) {
+        return runSingle(useVolatile, settleMillis, "单次调用");
+    }
+
+    /**
+     * 跑一轮实验，{@code tag} 只用于日志，让对照实验里每条日志都能看出是第几轮。
+     *
+     * @param useVolatile  true 用 volatile 字段，false 用普通字段
+     * @param settleMillis 置位前留给 JIT 的时间
+     * @param tag          日志标记，例如"第 2 轮"
+     * @return 本轮结果
+     */
+    private HoistResult runSingle(boolean useVolatile, long settleMillis, String tag) {
         if (settleMillis < 1L || settleMillis > 5_000L) {
             throw new IllegalArgumentException("settleMillis 必须落在 [1, 5000]");
         }
+        // 上限按本机速度现算，保证它会晚于置位时刻才到达
+        long spinLimit = calibrateSpinLimit(settleMillis, tag);
         // 每次调用都新建 holder：两个请求同时跑不会互相看到对方的标记位。
         // 注意必须用两个不同的类，而不是一个带泛型的类 —— 字段的 volatile 修饰
         // 是编译期属性，只有两个独立的 final 类才能让 C2 看到两种不同的内存语义。
@@ -198,11 +228,13 @@ public class VisibilityDemo {
 
         Thread reader = new Thread(() -> {
             long n = useVolatile
-                    ? spinOnVolatile(vol)
-                    : spinOnPlain(plain);
+                    ? spinOnVolatile(vol, spinLimit)
+                    : spinOnPlain(plain, spinLimit);
             spins.set(n);
         }, "hoist-reader");
         reader.setDaemon(true);
+        log.info("【读提升实验】{}｜{}｜开始：读线程执行 while(!stop && n<limit){n++}，{}ms 后置位；本轮上限 {} 次",
+                tag, variantLabel(useVolatile), settleMillis, spinLimit);
         reader.start();
 
         long begin = System.nanoTime();
@@ -215,7 +247,7 @@ public class VisibilityDemo {
             throw new IllegalStateException("等待 JIT 编译时被中断", e);
         }
 
-        log.info("【读提升实验】开始置位，useVolatile={}，已让读线程空转 {}ms", useVolatile, settleMillis);
+        log.info("【读提升实验】{}｜{}｜现在置位 stop=true", tag, variantLabel(useVolatile));
         // 这里是唯一的变量：写同一个语义的标记位，只是字段一个是 volatile 一个不是
         if (useVolatile) {
             vol.stop = true;
@@ -224,7 +256,9 @@ public class VisibilityDemo {
         }
 
         try {
-            reader.join(HOIST_JOIN_MILLIS);
+            // 宽限时间要跟着上限走：上限对应 settleMillis + 1 秒的自旋，
+            // 这里再加 3 秒余量，保证"跑满上限"的那一刻我们还没放弃等待
+            reader.join(settleMillis + HOIST_EXTRA_MILLIS + HOIST_JOIN_BUFFER_MILLIS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException("等待读线程退出时被中断", e);
@@ -232,17 +266,65 @@ public class VisibilityDemo {
 
         long elapsedMillis = Math.max(1L, (System.nanoTime() - begin) / 1_000_000L);
         long actualSpins = spins.get();
-        boolean sawWrite = actualSpins >= 0L && actualSpins < HOIST_SPIN_LIMIT;
-        if (sawWrite) {
-            log.info("【读提升实验】读线程看到了写入并退出：自旋 {} 次，耗时 {}ms。"
-                            + "这就是 volatile 承诺的可见性", actualSpins, elapsedMillis);
-        } else {
-            log.warn("【读提升实验】读线程跑满 {} 次上限才退出：写入从未对它可见。"
-                            + "原因是循环里那次字段读被 C2 提出了循环，循环体里再也不存在读内存这个动作",
-                    HOIST_SPIN_LIMIT);
+        if (actualSpins < 0L) {
+            // join 超时：读线程既没看到写入、也没跑完上限，本轮数据不可用，不能算成"卡死"
+            log.warn("【读提升实验】{}｜{}｜结果：读线程在 {}ms 内仍未退出，本轮无法判定。"
+                            + "机器负载过高或上限估得过大，请重跑",
+                    tag, variantLabel(useVolatile), elapsedMillis);
+            return new HoistResult(useVolatile, false, -1L, spinLimit, settleMillis, elapsedMillis);
         }
-        return new HoistResult(useVolatile, sawWrite, actualSpins, HOIST_SPIN_LIMIT,
+        boolean sawWrite = actualSpins < spinLimit;
+        if (sawWrite) {
+            log.info("【读提升实验】{}｜{}｜结果：看到写入，自旋 {} 次（上限 {}），耗时 {}ms。"
+                            + "判读：读没有被提出循环，写线程的修改对读线程可见",
+                    tag, variantLabel(useVolatile), actualSpins, spinLimit, elapsedMillis);
+        } else {
+            log.warn("【读提升实验】{}｜{}｜结果：跑满上限 {} 次仍未看到写入，耗时 {}ms。"
+                            + "判读：这次字段读被 C2 提出了循环，循环体内已不存在读内存的动作，"
+                            + "写线程的修改对它永远不可见",
+                    tag, variantLabel(useVolatile), spinLimit, elapsedMillis);
+        }
+        return new HoistResult(useVolatile, sawWrite, actualSpins, spinLimit,
                 settleMillis, elapsedMillis);
+    }
+
+    /**
+     * 给日志用的组名：一眼能看出这条日志说的是哪一组。
+     *
+     * @param useVolatile 是否使用 volatile 字段
+     * @return A 组（普通字段）或 B 组（volatile 字段）
+     */
+    private static String variantLabel(boolean useVolatile) {
+        return useVolatile ? "B组 volatile 字段" : "A组 普通字段(无volatile)";
+    }
+
+    /**
+     * 按本机实测自旋速度推算本轮上限。
+     *
+     * <p>上限必须落在"置位之后"，否则读线程会先因为跑满上限退出，
+     * 两组都会报没看到写入，实验失去意义。所以先用探针实测每毫秒能自旋多少次，
+     * 再按 {@code settleMillis + 1 秒} 折算。
+     *
+     * <p>探针用的是与实验完全相同的循环（{@link #spinOnPlain(PlainStop, long)}），
+     * 只是它的 stop 永远为 false，因此必然跑满 {@link #CALIBRATION_SPINS} 次。
+     * 顺带把这段循环预热了，A 组更容易稳定进入 C2 编译后的状态。
+     *
+     * @param settleMillis 置位前的等待时间
+     * @param tag          日志标记，标明是哪一组在算
+     * @return 本轮自旋上限
+     */
+    private static long calibrateSpinLimit(long settleMillis, String tag) {
+        PlainStop probe = new PlainStop();
+        long sampleBegin = System.nanoTime();
+        long sampleSpins = spinOnPlain(probe, CALIBRATION_SPINS);
+        long sampleNanos = Math.max(1L, System.nanoTime() - sampleBegin);
+        // 每毫秒能自旋多少次；先乘 1_000_000 再除，避免整数除法把结果截成 0
+        long spinsPerMilli = Math.max(1L, sampleSpins * 1_000_000L / sampleNanos);
+        long limit = spinsPerMilli * (settleMillis + HOIST_EXTRA_MILLIS);
+        limit = Math.max(HOIST_MIN_SPIN_LIMIT, limit);
+        log.debug("【读提升实验】{}｜校准：空转 {} 次耗时 {}ns，约 {} 次/ms，本轮上限 {} 次",
+                tag, sampleSpins, sampleNanos, spinsPerMilli, limit);
+        return limit;
     }
 
     /**
@@ -261,8 +343,10 @@ public class VisibilityDemo {
      * 可能还在解释执行，之后 C2 完成提升就再也不看内存了）；
      * volatile 的 {@code volatileStuck} 恒为 0，因为 volatile 读禁止被提升。
      *
-     * <p>【耗时提醒】每一轮约等于 {@code settleMillis + 0.2s}，两组加起来
-     * 总共 {@code 2 * trials * (settleMillis + 0.2s)}。默认参数大约 13 秒，属正常。
+     * <p>【耗时提醒】普通字段那一组如果读被提升，就要一路自旋到上限
+     * （上限按 {@code settleMillis + 1s} 折算），volatile 那组在置位后立刻退出。
+     * 最坏情况约 {@code trials * (settleMillis * 2 + 1s)}，默认参数（2000ms × 3 轮）大约 15 秒，
+     * 属于正常，不是卡死。
      *
      * @param settleMillis 每轮置位前留给 JIT 的时间，取值 [1, 5000]
      * @param trials       每组的轮数，取值 [1, 5]
@@ -279,17 +363,34 @@ public class VisibilityDemo {
         }
         List<HoistResult> plainRuns = new ArrayList<>(trials);
         List<HoistResult> volatileRuns = new ArrayList<>(trials);
-        log.info("【对照实验】开始，settleMillis={}，每组 {} 轮，预计耗时约 {} 秒",
-                settleMillis, trials, Math.round(2 * trials * (settleMillis + 200L) / 1000.0));
+        log.info("【读提升对照实验】测什么：同一个干净自旋循环 while(!stop && n<limit){n++}，"
+                + "唯一差别是 stop 字段加不加 volatile，看 C2 会不会把这次字段读提出循环");
+        log.info("【读提升对照实验】谁和谁对照：A组 = 普通字段（无 volatile），B组 = volatile 字段；"
+                + "两组交替执行各 {} 轮，每轮先跑 {}ms 让 C2 编译完成再置位", trials, settleMillis);
         for (int i = 0; i < trials; i++) {
-            // 固定顺序：普通在前、volatile 在后，每轮都一样，避免顺序本身变成变量
-            plainRuns.add(runHoisting(false, settleMillis));
-            volatileRuns.add(runHoisting(true, settleMillis));
+            String round = "第 " + (i + 1) + "/" + trials + " 轮";
+            // 交替顺序固定为 A 在前、B 在后，但每轮都成对出现，
+            // 避免"先跑完一组再跑另一组"造成 JIT 预热条件不对等
+            plainRuns.add(runSingle(false, settleMillis, round + " A组"));
+            volatileRuns.add(runSingle(true, settleMillis, round + " B组"));
         }
         int plainStuck = countStuck(plainRuns);
         int volatileStuck = countStuck(volatileRuns);
-        log.info("【对照实验】完成，普通字段跑满上限 {}/{} 轮，volatile 跑满上限 {}/{} 轮",
-                plainStuck, trials, volatileStuck, trials);
+        log.info("【读提升对照实验】========== 汇总（{} 轮 × 2 组）==========", trials);
+        log.info("【读提升对照实验】A组 普通字段(无volatile)：跑满上限 {}/{} 轮，看到写入 {}/{} 轮",
+                plainStuck, trials, trials - plainStuck, trials);
+        log.info("【读提升对照实验】B组 volatile 字段          ：跑满上限 {}/{} 轮，看到写入 {}/{} 轮",
+                volatileStuck, trials, trials - volatileStuck, trials);
+        if (plainStuck > 0 && volatileStuck == 0) {
+            log.info("【读提升对照实验】判读：A组出现过读提升（写入永远看不到），B组从未出现 —— "
+                    + "这就是 volatile 的作用：禁止把字段读提出循环");
+        } else if (volatileStuck > 0) {
+            log.warn("【读提升对照实验】判读：B组也卡住了，说明本轮上限没有晚于置位时刻到达，"
+                    + "结果不可信，请调大 settleMillis 或重跑");
+        } else {
+            log.info("【读提升对照实验】判读：A组本轮还没触发读提升（C2 可能尚未编译完），"
+                    + "加大 settleMillis 或增加 trials 再看");
+        }
         return new CompareResult(settleMillis, trials, plainStuck, volatileStuck,
                 plainRuns, volatileRuns);
     }
@@ -303,8 +404,8 @@ public class VisibilityDemo {
     private static int countStuck(List<HoistResult> runs) {
         int stuck = 0;
         for (HoistResult run : runs) {
-            // sawWrite=false 唯一可能的原因就是读被提出了循环，此时 spins 必然等于上限
-            if (!run.sawWrite()) {
+            // 只有"自旋次数正好等于上限"才算跑满；spins=-1 表示 join 超时、数据不可用，不计数
+            if (run.spins() >= 0L && run.spins() == run.spinLimit()) {
                 stuck++;
             }
         }
@@ -336,27 +437,32 @@ public class VisibilityDemo {
      * 从而真的去做读提升。别把它改成"调用 {@link PlainStop#get()}"——
      * 多一层方法调用，C2 就更可能放弃提升，实验立刻失去意义。
      *
+     * @param holder 持有普通字段 stop 的容器
+     * @param limit  自旋上限，由 {@link #calibrateSpinLimit(long, String)} 按本机速度算出，
+     *               保证它晚于置位时刻才到达，否则读线程会先跑满退出，实验失真
      * @return 退出时累计的自旋次数
      */
-    private static long spinOnPlain(PlainStop holder) {
+    private static long spinOnPlain(PlainStop holder, long limit) {
         long spins = 0L;
-        while (!holder.stop && spins < HOIST_SPIN_LIMIT) {
+        while (!holder.stop && spins < limit) {
             spins++;
         }
         return spins;
     }
 
     /**
-     * 干净自旋：与 {@link #spinOnPlain(PlainStop)} 逐字对应，只差字段的 volatile。
+     * 干净自旋：与 {@link #spinOnPlain(PlainStop, long)} 逐字对应，只差字段的 volatile。
      *
      * <p>volatile 读自带"每次都必须从内存/缓存一致性协议拿最新值"的语义，
      * C2 不允许把它提出循环，所以这个循环一定能看到其他线程的写入。
      *
+     * @param holder 持有 volatile 字段 stop 的容器
+     * @param limit  自旋上限，与 A 组用完全相同的算法，保证两组条件对等
      * @return 退出时累计的自旋次数
      */
-    private static long spinOnVolatile(VolatileStop holder) {
+    private static long spinOnVolatile(VolatileStop holder, long limit) {
         long spins = 0L;
-        while (!holder.stop && spins < HOIST_SPIN_LIMIT) {
+        while (!holder.stop && spins < limit) {
             spins++;
         }
         return spins;
@@ -384,7 +490,8 @@ public class VisibilityDemo {
      * @param useVolatile  本次是否用了 volatile
      * @param sawWrite     读线程是否在上限之前看到了写入；false 说明读被提出了循环
      * @param spins        读线程实际自旋了多少次
-     * @param spinLimit    上限值，{@code spins} 等于它就是"跑满了没看到"
+     * @param spinLimit    本轮上限值（按本机自旋速度动态推算，每轮/每组都不同），
+     *                     {@code spins} 等于它就是"跑满了没看到"
      * @param settleMillis 置位前留给 JIT 的时间
      * @param elapsedMillis 从启动读线程到它退出（或被判定跑满）的耗时
      */

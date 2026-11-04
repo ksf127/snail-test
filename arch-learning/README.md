@@ -83,9 +83,9 @@ curl "http://localhost:8201/phase1/concurrency/visibility?useVolatile=true&timeo
 #### 真正能看出差别的接口：`/visibility/hoisting`
 
 ```powershell
-# 普通字段：读线程一路自旋到 20 亿次上限，写入从未可见
+# A组（普通字段）：读线程一路自旋到本轮上限，写入从未可见
 curl "http://localhost:8201/phase1/concurrency/visibility/hoisting?useVolatile=false&settleMillis=500"
-# volatile：主线程一置位它立刻退出
+# B组（volatile 字段）：主线程一置位它立刻退出
 curl "http://localhost:8201/phase1/concurrency/visibility/hoisting?useVolatile=true&settleMillis=500"
 ```
 
@@ -93,24 +93,28 @@ curl "http://localhost:8201/phase1/concurrency/visibility/hoisting?useVolatile=t
 
 ```java
 long spins = 0L;
-while (!holder.stop && spins < LIMIT) { spins++; }
+while (!holder.stop && spins < limit) { spins++; }
 ```
 
-条件里只有一次字段读、循环体只有一次自增，C2 能证明「循环期间没人写这个字段」，于是把读挪到循环外只做一次，循环退化成 `while (spins < LIMIT)` —— 这就是 **loop-invariant code motion（读提升）**。
+条件里只有一次字段读、循环体只有一次自增，C2 能证明「循环期间没人写这个字段」，于是把读挪到循环外只做一次，循环退化成 `while (spins < limit)` —— 这就是 **loop-invariant code motion（读提升）**。
 
 | 参数 | 返回 `sawWrite` | `spins` | 含义 |
 |---|---|---|---|
-| `useVolatile=false` | `false` | 等于 `spinLimit`（20 亿） | 读被提出循环，写入永远看不到 |
-| `useVolatile=true` | `true` | 远小于上限（实测约 4.5 亿） | volatile 读禁止提升，立刻看到 |
+| `useVolatile=false` | `false` | 等于 `spinLimit` | 读被提出循环，写入永远看不到 |
+| `useVolatile=true` | `true` | 远小于 `spinLimit`（本机实测约 1.5~4.5 亿） | volatile 读禁止提升，立刻看到 |
 
-本机实测日志：
+**`spinLimit` 不是常量，是每轮按本机实测速度现算的**：先用与实验完全相同的循环空转 5000 万次，量出每毫秒能自旋多少次，再乘 `settleMillis + 1000ms`。原因很实在——写死过 20 亿，本机自旋约 15 亿次/秒，1.3 秒就跑满退出，比 `settleMillis=2000` 还短，置位发生在它结束之后，两组都报「没看到写入」，实验直接失效（这就是「volatile 没体现出来」的根因）。
+
+本机实测日志（`settleMillis=300`）：
 
 ```
-WARN  读线程跑满 2000000000 次上限才退出：写入从未对它可见
-INFO  读线程看到了写入并退出：自旋 451178365 次，耗时 311ms
+INFO  【读提升实验】单次调用｜A组 普通字段(无volatile)｜开始：读线程执行 while(!stop && n<limit){n++}，300ms 后置位；本轮上限 3120139100 次
+INFO  【读提升实验】单次调用｜A组 普通字段(无volatile)｜现在置位 stop=true
+WARN  【读提升实验】单次调用｜A组 普通字段(无volatile)｜结果：跑满上限 3120139100 次仍未看到写入，耗时 1280ms → 读被提出循环
+INFO  【读提升实验】单次调用｜B组 volatile 字段｜结果：看到写入，自旋 448657158 次（上限 3479862100），耗时 312ms → 读没有被提出循环
 ```
 
-这就是**两个数量级、且方向确定**的差异 —— 一眼能分辨，不是噪声。
+这就是**一个数量级、且方向确定**的差异 —— 一眼能分辨，不是噪声。
 
 为什么 `spins` 要设上限：没有上限的话普通字段那次会永远转下去，把 Tomcat 请求线程彻底挂死。加上限后「没看到写入」表现为「跑满上限」，照样能判定，但不会拖垮服务。
 
@@ -122,22 +126,23 @@ INFO  读线程看到了写入并退出：自旋 451178365 次，耗时 311ms
 curl "http://localhost:8201/phase1/concurrency/visibility/hoisting/compare?settleMillis=2000&trials=3"
 ```
 
-同一套循环，普通字段和 volatile 字段各跑 `trials` 轮，**交替执行**（否则先跑的那组会独占 JIT 预热，条件不对等），最后统计各自「跑满上限才退出」的次数：
+同一套循环，普通字段（A组）和 volatile 字段（B组）各跑 `trials` 轮，**交替执行**（否则先跑的那组会独占 JIT 预热，条件不对等），最后统计各自「跑满上限才退出」的次数：
 
-| 字段 | `settleMillis` | `trials` | 返回字段 | 实测 |
-|---|---|---|---|---|
-| 普通 | 2000 | 3 | `plainStuck` | `3`（接近 `trials`，说明读被提升） |
-| volatile | 2000 | 3 | `volatileStuck` | `0`（恒为 0） |
+| 组 | 字段 | `settleMillis` | `trials` | 返回字段 | 实测 |
+|---|---|---|---|---|---|
+| A组 | 普通（无 volatile） | 2000 | 3 | `plainStuck` | `3`（说明读被提升） |
+| B组 | volatile | 2000 | 3 | `volatileStuck` | `0`（恒为 0） |
 
 返回体里 `plainRuns` / `volatileRuns` 是每轮的明细，可以逐轮看 `spins` 和 `sawWrite`。
 
-**耗时**：约 `2 × trials × settleMillis`，默认参数（2000ms × 3 轮 × 2 组）大约 13 秒，不是卡死。
+**耗时**：A组一旦读提升就要跑满上限（`settleMillis + 1s`），B组置位后立刻退出。最坏约 `trials × (2 × settleMillis + 1s)`，默认参数（2000ms × 3 轮）大约 15 秒，不是卡死。
 
 判读：
 
 - `plainStuck == trials` → 每一轮都卡死，读提升已经稳定生效；
 - `plainStuck < trials` → 前几轮还在解释执行，之后 C2 编译完成就再也不看内存了 —— **这正是最危险的地方：本地第一次跑能过，上线跑一会儿就卡死**；
-- `volatileStuck == 0` → volatile 读禁止被提升，任何轮次都能看到写入。
+- `volatileStuck == 0` → volatile 读禁止被提升，任何轮次都能看到写入；
+- `volatileStuck > 0` → 说明本轮上限没有晚于置位时刻到达，结果不可信，日志会直接提示重跑。
 
 > 工程结论：`useVolatile=false` 在这台机器上「跑得通」不能证明代码是对的。读提升是否发生取决于 C2 的现场决策——解释执行阶段不会提升，编译后就永远不提升了。换 ARM、换 JDK、改一行循环体，问题就可能突然出现。**并发正确性只能靠 JMM 推，不能靠「跑通倒推」**。
 
