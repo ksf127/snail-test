@@ -1,0 +1,16 @@
+spring:
+  main:
+    web-application-type: none
+
+# 真实行情导入：只跑一次批处理，不启动 Web 端口。
+# 用法：mvn -pl trade-journal spring-boot:run -Dspring-boot.run.profiles=sector-import
+trade-journal:
+  sector-import:
+    enabled: true
+    # 东方财富 secid：0=深市 1=沪市。中证银行 399986 在深市。
+    secid: "0.399986"
+    # 留空则默认导入最近 30 天
+    start: ""
+    end: ""
+    # 先删除 V2 脚本写入的 note='示例' 行，再写入真实行情
+    purge-sample: true

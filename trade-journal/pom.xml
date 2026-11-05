@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.company</groupId>
+        <artifactId>company-parent</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+        <relativePath>../company-parent/pom.xml</relativePath>
+    </parent>
+
+    <artifactId>trade-journal</artifactId>
+    <name>trade-journal</name>
+    <description>交易复盘系统：记录计划、成交、持仓快照与纪律违背，用 SQL 出统计</description>
+
+    <dependencies>
+        <!-- 统一返回体 ApiResult 与全局异常处理 -->
+        <dependency>
+            <groupId>com.company</groupId>
+            <artifactId>company-common-web</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+
+        <!-- 驱动、Flyway、MyBatis-Plus 都由 Starter 下发，本模块不直接依赖中间件客户端 -->
+        <dependency>
+            <groupId>com.company</groupId>
+            <artifactId>company-mybatis-starter</artifactId>
+        </dependency>
+
+        <!-- 实体与 DTO 用 @Data 生成读写方法，版本由 company-bom 锁定 -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+        </dependency>
+
+        <!-- 成交导入：解析 .xlsx 并生成下载模板。BOM 未托管该版本，这里显式指定 -->
+        <dependency>
+            <groupId>org.apache.poi</groupId>
+            <artifactId>poi-ooxml</artifactId>
+            <version>5.5.1</version>
+        </dependency>
+
+        <!-- 自动下载：用浏览器打开券商导出页并点导出，把文件落到下载目录。
+             只复用本机已安装的 Chrome/Edge，不需要额外下载 Chromium 内核 -->
+        <dependency>
+            <groupId>com.microsoft.playwright</groupId>
+            <artifactId>playwright</artifactId>
+            <version>1.47.0</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>

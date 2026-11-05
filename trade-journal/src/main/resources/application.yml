@@ -1,0 +1,81 @@
+server:
+  port: ${SERVER_PORT:8205}
+
+spring:
+  application:
+    name: trade-journal
+  # 纯本地服务，不接 Nacos：复盘数据属于个人数据，不应该依赖注册中心才能启动
+  datasource:
+    url: jdbc:mysql://${MYSQL_HOST:127.0.0.1}:${MYSQL_PORT:3306}/${MYSQL_DB:trade_journal}?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
+    username: ${MYSQL_USER:root}
+    password: ${MYSQL_PASSWORD:root}
+    hikari:
+      maximum-pool-size: 10
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+    locations: classpath:db/migration
+  task:
+    scheduling:
+      pool:
+        # 自动下载要开浏览器，耗时几十秒；独立线程池避免把自动同步的定时任务堵住
+        size: 4
+
+mybatis-plus:
+  configuration:
+    # 数据库是 snake_case、实体是 camelCase，必须开启，否则 avg_cost 之类的字段全是 null
+    map-underscore-to-camel-case: true
+  global-config:
+    banner: false
+    db-config:
+      id-type: auto
+
+logging:
+  level:
+    com.company.tradejournal: info
+
+# 自动同步：定时扫描下载目录，把券商导出的文件自动入库
+# 在券商客户端把「导出」的保存位置设成下面这个目录，之后每天 09:35 / 11:35 / 13:05 / 15:05 自动入库
+trade-journal:
+  sync:
+    enabled: true
+    directories:
+      - ${SYNC_DIR:${user.home}/Downloads}
+    account-id: 1
+    default-reason: 自动同步
+    # 只处理最近 12 小时内修改过的文件，避免首次启动把历史导出全部导入
+    max-age-minutes: 720
+    max-files: 50
+    recent-limit: 20
+
+  # 自动下载：到点用本机 Chrome 打开券商导出页、点导出，文件落到下载目录后自动入库
+  # 页面地址和按钮位置每家券商都不一样，所以写成可配置步骤；页面改版只改这里
+  download:
+    enabled: true
+    # 定时任务无头运行；首次登录用 POST /downloads/login，会强制有头
+    headless: true
+    # chrome / msedge 复用本机已安装的浏览器，不用额外下载 Chromium 内核
+    channel: msedge
+    user-data-dir: ${user.home}/.trade-journal/browser
+    timeout-seconds: 45
+    # 下载落地目录；不填则复用上面 sync.directories
+    directories: []
+    # 券商任务示例（把注释去掉并按实际页面改 url 与 selector 即可）：
+    # brokers:
+    #   - name: 华泰
+    #     url: https://trade.htsc.com.cn/xxx
+    #     steps:
+    #       - action: waitForSelector
+    #         selector: "#menu-query"
+    #       - action: click
+    #         selector: "#menu-query"
+    #       - action: click
+    #         selector: "#export-button"
+    #       - action: download
+    #         selector: "#export-button"
+    #   - name: 东方财富
+    #     url: https://jywg.18.cn/xxx
+    #     steps:
+    #       - action: download
+    #         selector: "#export"
+    brokers: []
