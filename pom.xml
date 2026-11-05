@@ -22,6 +22,7 @@
         <module>company-starters</module>
         <module>company-api</module>
         <module>company-services</module>
+        <module>trade-journal</module>
         <module>arch-learning</module>
     </modules>
 </project>
